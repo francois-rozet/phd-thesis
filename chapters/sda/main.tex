@@ -1,0 +1,477 @@
+\chapter{Score-based Data Assimilation} \label{chap:sda}
+
+\begin{quote}
+    \textit{A simple chain is an infinite sequence $x_1, x_2, \dots, x_k, x_{k+1}, \dots$ of variables connected in such a way that $x_{k+1}$ for any $k$ is independent of $x_1, x_2, \dots, x_{k-1}$ in case $x_k$ is known.}
+
+    \begin{flushright}
+        --- Andrei Markov (1906) \nocite{basharin2004life}
+    \end{flushright}
+\end{quote}
+
+\vspace{2em}
+
+\begin{addendum}{\Large\scshape Addendum}
+
+This chapter has previously been published as
+
+\begin{itemize}[leftmargin=1em]
+    \item[] \fullcite{rozet2023scorebased}.
+\end{itemize}
+
+As the leading author, François came up with the method, formalized it, conducted the experiments, interpreted the results, and wrote the manuscript. Gilles supervised the project, suggested experiments, and participated in the writing and literature review.
+
+For the version presented in this chapter, we have slightly edited the mathematical notations from the original publication. Notably, the diffusion time notation $x(t)$ has been replaced by the leaner $x_t$, which is more common in nowadays literature and more consistent with the rest of this document. The text itself remains unchanged, although we have enhanced it with a few retrospective comments.
+
+\end{addendum}
+
+\section*{Abstract}
+
+Data assimilation, in its most comprehensive form, addresses the Bayesian inverse problem of identifying plausible state trajectories that explain noisy or incomplete observations of stochastic dynamical systems. Various approaches have been proposed to solve this problem, including particle-based and variational methods. However, most algorithms depend on the transition dynamics for inference, which becomes intractable for long time horizons or for high-dimensional systems with complex dynamics, such as oceans or atmospheres. In this work, we introduce score-based data assimilation for trajectory inference. We learn a score-based generative model of state trajectories based on the key insight that the score of an arbitrarily long trajectory can be decomposed into a series of scores over short segments. After training, inference is carried out using the score model, in a non-autoregressive manner by generating all states simultaneously. Quite distinctively, we decouple the observation model from the training procedure and use it only at inference to guide the generative process, which enables a wide range of zero-shot observation scenarios. We present theoretical and empirical evidence supporting the effectiveness of our method.
+
+\section{Introduction}
+
+Data assimilation (DA) \cite{lorenc1986analysis, ledimet1986variational, evensen1994sequential, hamill2006ensemblebased,tremolet2006accounting, tremolet2007modelerror, fisher2011weakconstraint, carrassi2018data, ecmwf2020ifs} is at the core of many scientific domains concerned with the study of complex dynamical systems such as atmospheres, oceans or climates. The purpose of DA is to infer the state of a system evolving over time based on various sources of imperfect information, including sparse, intermittent, and noisy observations.
+
+Formally, let $x^{1:L} = (x^1, x^2, \dots, x^L) \in \mathbb{R}^{L \times D}$ denote a trajectory of states in a discrete-time stochastic dynamical system and $p(x^{i+1} \mid x^i)$ be the transition dynamics from state $x^i$ to state $x^{i+1}$. An observation $y \in \mathbb{R}^M$ of the state trajectory $x^{1:L}$ follows an observation process $p(y \mid x^{1:L})$, generally formulated as $y = \mathcal{A}(x^{1:L}) + \eta$, where the measurement function $\mathcal{A}: \mathbb{R}^{L \times D} \mapsto \mathbb{R}^M$ is often non-linear and the observational error $\eta \in \mathbb{R}^M$ is a stochastic additive term that accounts for instrumental noise and systematic uncertainties. In this framework, the goal of DA is to solve the inverse problem of inferring plausible trajectories $x^{1:L}$ given an observation $y$, that is, to estimate the trajectory posterior
+\begin{equation}
+    p(x^{1:L} \mid y) = \frac{p(y \mid x^{1:L})}{p(y)} \, p(x^1) \prod_{i=1}^{L-1} p(x^{i+1} \mid x^i)
+\end{equation}
+where the initial state prior $p(x^1)$ is commonly referred to as background \cite{tremolet2006accounting, tremolet2007modelerror, fisher2011weakconstraint, carrassi2018data, ecmwf2020ifs}. In geosciences, the amount of data available is generally insufficient to recover the full state of the system from the observation alone \cite{carrassi2018data}. For this reason, the physical model underlying the transition dynamics is of paramount importance to fill in spatial and temporal gaps in the observation.
+
+State-of-the-art approaches to data assimilation are based on variational assimilation \cite{lorenc1986analysis, ledimet1986variational, tremolet2006accounting, tremolet2007modelerror, fisher2011weakconstraint}. Many of these approaches formulate the task as a maximum-a-posteriori (MAP) estimation problem and solve it by maximizing the log-posterior density $\log p(x^{1:L} \mid y)$ via gradient ascent. Although this approach only produces a point estimate of the trajectory posterior, its cost can already be substantial for problems of the size and complexity of geophysical systems, since it requires differentiating through the physical model. The amount of data that can be assimilated is therefore restricted because of computational limitations. For example, only a small volume of the available satellite data is exploited for operational forecasts and yet, even with these restrictions, data assimilation accounts for a significant fraction of the computational cost for modern numerical weather prediction \cite{bauer2015quiet, gustafsson2018survey}.
+%
+Recent work has shown that deep learning can be used in a variety of ways to improve the computational efficiency of data assimilation, increase the reconstruction performance by estimating unresolved scales after data assimilation, or integrate multiple sources of observations \cite{mack2020attentionbased, arcucci2021deep, frerix2021variational, fablet2021learning,yeung2022physicsinformed, brajard2020combining, brajard2021combining, zhang2022multisource}.
+
+\paragraph{Contributions}
+In this work, we propose a novel approach to data assimilation based on score-based generative models. Leveraging the Markovian structure of dynamical systems, we train a score network from short segments of trajectories which is then capable of generating physically consistent and arbitrarily-long state trajectories. The observation model is decoupled from the score network and used only during assimilation to guide the generative process, which allows for a wide range of zero-shot observation scenarios. Our approach provides an accurate approximation of the whole trajectory posterior -- it is not limited to point estimates -- without simulating or differentiating through the physical model. The code for all experiments is made available at \url{https://github.com/francois-rozet/sda}.
+
+\section{Background}
+
+Score-based generative models have recently shown remarkable capabilities, powering many of the latest advances in image, video or audio generation \cite{rombach2022highresolution, ramesh2022hierarchical, saharia2022photorealistic, ho2022video, ho2022cascaded, ho2022imagen, kong2021diffwave, goel2022its}. In this section, we review score-based generative models and outline how they can be used for solving inverse problems.
+
+\paragraph{Continuous-time score-based generative models}
+Adapting the formulation of \textcite{song2021scorebased}, samples $x \in \mathbb{R}^D$ from a distribution $p(x)$ are progressively perturbed through a continuous-time diffusion process expressed as a linear stochastic differential equation (SDE)
+\begin{equation} \label{eq:sda-forward-sde}
+    \d{x_t} = f_t \, x_t \d{t} + g_t \d{w_t}
+\end{equation}
+where $f_t \in \mathbb{R}$ is the drift coefficient, $g_t \in \mathbb{R}$ is the diffusion coefficient, $w_t \in \mathbb{R}^D$ denotes a Wiener process (standard Brownian motion) and $x_t \in \mathbb{R}^D$ is the perturbed sample at time $t \in [0, 1]$. Because the SDE is linear with respect to $x_t$, the perturbation kernel from $x$ to $x_t$ is Gaussian and takes the form
+\begin{equation}
+    p(x_t \mid x) = \mathcal{N}(x_t \mid \alpha_t \, x, \Sigma_t)
+\end{equation}
+where $\alpha_t$ and $\Sigma_t = \sigma_t^2 I$ can be derived analytically from $f_t$ and $g_t$ \cite{sarkka2019applied, zhang2023fast}. Denoting $p(x_t)$ the marginal distribution of $x_t$, we impose that $\alpha_0 = 1$ and $\sigma_0 \ll 1$, such that $p(x_0) \approx p(x)$, and we chose the coefficients $f_t$ and $g_t$ such that the influence of the initial sample $x$ on the final perturbed sample $x_1$ is negligible with respect to the noise level -- that is, $p(x_1) \approx \mathcal{N}(0, \Sigma_1)$. The variance exploding (VE) and variance preserving (VP) SDEs \cite{song2019generative, ho2020denoising, song2021scorebased} are widespread examples satisfying these constraints.
+
+Crucially, the time reversal of the forward SDE \eqref{eq:sda-forward-sde} is given by a reverse SDE \cite{anderson1982reversetime, song2021scorebased}
+\begin{equation} \label{eq:sda-reverse-sde}
+    \d{x_t} = \left[ f_t \, x_t - g_t^2 \, \grad{x_t} \log p(x_t) \right] \d{t} + g_t \d{w_t} .
+\end{equation}
+That is, we can draw noise samples $x_1 \sim \mathcal{N}(0, \Sigma_1)$ and gradually remove the noise therein to obtain data samples $x_0 \sim p(x_0)$ by simulating the reverse SDE from $t = 1$ to $0$. This requires access to the quantity $\grad{x_t} \log p(x_t)$ known as the score of $p(x_t)$.
+
+\paragraph{Denoising score matching}
+In practice, the score $\grad{x_t} \log p(x_t)$ is approximated by a neural network $s_\phi(x_t, t)$, named the score network, which is trained to solve the denoising score matching objective \cite{hyvarinen2005estimation, vincent2011connection, song2021scorebased}
+\begin{equation} \label{eq:sda-dsm-objective}
+    \arg\min_\phi \mathbb{E}_{p(x) p_t p(x_t \mid x)} \left[ \sigma_t^2 \left\| s_\phi(x_t, t) - \grad{x_t} \log p(x_t \mid x) \right\|_2^2 \right]
+\end{equation}
+where $p_t = \mathcal{U}(0, 1)$. The theory of denoising score matching ensures that $s_\phi(x_t, t) \approx \grad{x_t} \log p(x_t)$ for a sufficiently expressive score network. After training, the score network is plugged into the reverse SDE \eqref{eq:sda-reverse-sde}, which is then simulated using an appropriate discretization scheme \cite{song2021scorebased, song2021denoising, liu2022pseudo, zhang2023fast}.
+
+\sidenote{\vspace{1cm} \itshape We later found out that the EDM \cite{karras2022elucidating} or flow \cite{liu2023flow} parameterizations would have been better choices.}
+In practice, the high variance of $\grad{x_t} \log p(x_t \mid x)$ near $t = 0$ makes the optimization of \eqref{eq:sda-dsm-objective} unstable \cite{zhang2023fast}. To mitigate this issue, a slightly different parameterization $\epsilon_\phi(x_t, t) = -\sigma_t \, s_\phi(x_t, t)$ of the score network is often used, which leads to the otherwise equivalent objective \cite{ho2020denoising, song2021denoising, zhang2023fast}
+\begin{equation} \label{eq:sda-ddpm-objective}
+    \arg\min_\phi \mathbb{E}_{p(x) p_t p(\epsilon)} \left[ \left\| \epsilon_\phi(\alpha_t \, x + \sigma_t \, \epsilon, t) - \epsilon\right\|_2^2 \right]
+\end{equation}
+where $p(\epsilon) = \mathcal{N}(0, I)$. In the following, we keep the score network notation $s_\phi(x_t, t)$ for convenience, even though we adopt the parameterization $\epsilon_\phi(x_t, t)$ and its objective for our experiments.
+
+\paragraph{Zero-shot inverse problems}
+With score-based generative models, we can generate samples from the unconditional distribution $p(x_0) \approx p(x)$. To solve inverse problems, however, we need to sample from the posterior distribution $p(x \mid y)$. This could be accomplished by training a conditional score network $s_\phi(x_t, t \mid y)$ to approximate the posterior score $\grad{x_t} \log p(x_t \mid y)$ and plugging it into the reverse SDE \eqref{eq:sda-reverse-sde}. However, this would require data pairs $(x, y)$ during training and one would need to retrain a new score network each time the observation process $p(y \mid x)$ changes. Instead, many have observed \cite{song2021scorebased, kawar2021snips, song2022solving, adam2022posterior, chung2023diffusion} that the posterior score can be decomposed into two terms thanks to Bayes' rule
+\begin{equation} \label{eq:sda-score-bayes}
+    \grad{x_t} \log p(x_t \mid y) = \grad{x_t} \log p(x_t) + \grad{x_t} \log p(y \mid x_t) .
+\end{equation}
+Since the prior score $\grad{x_t} \log p(x_t)$ can be approximated with a single score network, the remaining task is to estimate the likelihood score $\grad{x_t} \log p(y \mid x_t)$. Assuming a differentiable measurement function $\mathcal{A}$ and a Gaussian observation process $p(y \mid x) = \mathcal{N}(y \mid \mathcal{A}(x), \Sigma_y)$, \textcite{chung2023diffusion} propose the approximation
+\begin{equation} \label{eq:sda-likelihood-approx-dps}
+    p(y \mid x_t) = \int p(y \mid x) \, p(x \mid x_t) \d{x} \approx \mathcal{N} \left(y \mid \mathcal{A}(\hat{x}(x_t)), \Sigma_y \right)
+\end{equation}
+where the mean $\hat{x}(x_t) = \mathbb{E}_{p(x \mid x_t)} [x]$ is given by Tweedie's formula \cite{efron2011tweedies, kim2021noise2score}
+\begin{align}
+    \mathbb{E}_{p(x \mid x_t)} [x] & = \frac{x_t + \sigma_t^2 \, \grad{x_t} \log p(x_t)}{\alpha_t} \label{eq:sda-tweedie} \\
+    & \approx \frac{x_t + \sigma_t^2 \, s_\phi(x_t, t)}{\alpha_t} \, .
+\end{align}
+As the log-likelihood of a multivariate Gaussian is known analytically and $s_\phi(x_t, t)$ is differentiable, we can compute the likelihood score $\grad{x_t} \log p(y \mid x_t)$ with this approximation in zero-shot, that is, without training any other network than $s_\phi(x_t, t)$.
+
+\section{Score-based data assimilation}
+
+Coming back to our initial inference problem, we want to approximate the trajectory posterior $p(x^{1:L} \mid y)$ of a dynamical system. To do so with score-based generative modeling, we need to estimate the posterior score $\grad{x^{1:L}_t} \log p(x^{1:L}_t \mid y)$, which we choose to decompose into prior and likelihood terms, as in \eqref{eq:sda-score-bayes}, to enable a wide range of zero-shot observation scenarios.
+
+In typical data assimilation settings, the high-dimensionality of each state $x^i$ (e.g. the state of atmospheres or oceans) combined with potentially long trajectories would require an impractically large score network $s_\phi(x^{1:L}_t, t)$ to estimate the prior score $\grad{x^{1:L}_t} \log p(x^{1:L}_t)$ and a proportional amount of data for training, which could be prohibitive if data is scarce or if the physical model is expensive to simulate. To overcome this challenge, we leverage the Markovian structure of dynamical systems to approximate the prior score with a series of local scores, which are easier to learn, as explained in Section \ref{sec:sda-sda-blanket}.
+%
+In Section \ref{sec:sda-sda-likelihood-score}, we build upon diffusion posterior sampling (DPS) \cite{chung2023diffusion} to propose a new approximation for the likelihood score $\grad{x^{1:L}_t} \log p(y \mid x^{1:L}_t)$, which we find more appropriate for posterior inference. Finally, in Section \ref{sec:sda-sda-pc-sampling}, we describe our sampling procedure inspired from predictor-corrector sampling \cite{song2021scorebased}. Our main contribution, named score-based data assimilation (SDA), is the combination of these three components.
+
+\subsection{How is your blanket?} \label{sec:sda-sda-blanket}
+\sidenote{\vspace{-1.75cm} \itshape This section's title is a reference to OSS 117, a classic french comedy movie. To our delight, one of the reviewers noticed this reference, and replied with another reference:\\ \enquote{The blanket is good.}}
+
+Given a set of random variables $x^{1:L} = \{ x^1, x^2, \dots, x^L \}$, it is sometimes possible to find a small Markov blanket $x^{b_i} \subseteq x^{\neq i}$ such that $p(x^i \mid x^{\neq i}) = p(x^i \mid x^{b_i})$ for each element $x^i$ using our knowledge of the set's structure. It follows that each element $\grad{x^i} \log p(x^{1:L})$ of the full score $\grad{x^{1:L}} \log p(x^{1:L})$ can be determined locally, that is, only using its blanket;
+\begin{align}
+    \grad{x^i} \log p(x^{1:L}) & = \grad{x^i} \log p(x^i \mid x^{\neq i}) + \grad{x^i} \log p(x^{\neq i}) \\
+    & = \grad{x^i} \log p(x^i \mid x^{b_i}) + \grad{x^i} \log p(x^{b_i}) = \grad{x^i} \log p(x^i, x^{b_i}).
+\end{align}
+This property generally does not hold for the diffusion-perturbed set $x^{1:L}_t$ as there is no guarantee that $x^{b_i}_t$ is a Markov blanket of the element $x^i_t$. However, there exists a set of indices $\bar{b}_i \supseteq b_i$ such that
+\begin{equation} \label{eq:sda-pseudo-blanket}
+   \grad{x^i_t} \log p(x^{1:L}_t) \approx \grad{x^i_t} \log p(x^i_t, x^{\bar{b}_i}_t)
+\end{equation}
+is a good approximation for all $t \in [0, 1]$. That is, $x^{\bar{b}_i}_t$ is a \enquote{pseudo} Markov blanket of $x^i_t$. In the worst case, $\bar{b}_i$ contains all indices except $i$, but we argue that, for some structures, there is a set $\bar{b}_i$ not much larger than $b_i$ that satisfies \eqref{eq:sda-pseudo-blanket}. Our rationale is that, since we impose the initial noise to be negligible, we know that $x^{b_i}_t$ becomes indistinguishable from $x^{b_i}$ as $t$ approaches $0$. Furthermore, as $t$ grows and noise accumulates, the mutual information between elements $x^i_t$ and $x^j_t$ decreases to finally reach $0$ when $t = 1$. Hence, even if $\bar{b}_i = b_i$, the pseudo-blanket approximation \eqref{eq:sda-pseudo-blanket} already holds near $t = 0$ and $t = 1$. In between, even though the approximation remains unbiased (see Appendix \ref{app:sda-unbiased}), the structure of the set becomes decisive. If it is known and present enough regularities/symmetries, \eqref{eq:sda-pseudo-blanket} could and should be exploited within the architecture of the score network $s_\phi(x^{1:L}_t, t)$.
+
+\begin{figure}[t]
+    \includegraphics[width=\textwidth]{./chapters/sda/figures/diffusion.pdf}
+    \caption{Trajectories $x^{1:L}$ of a dynamical system are transformed to noise via a \textcolor{RoyalBlue}{diffusion process}. Reversing this process generates new trajectories, but requires the \textcolor{RedOrange}{score of $p(x^{1:L}_t)$}. We approximate it by combining the outputs of a score network over \textcolor{PineGreen}{sub-segments of $x^{1:L}_t$}.}
+    \label{fig:diffusion}
+\end{figure}
+\sidenote{\vspace{-14.5cm} \itshape The lines connecting the stack of networks and the score $\grad{x_t^{1:L}} \log p(x_t^{1:L})$ represent Algorithm \ref{alg:composing}.}
+
+\sidenote{\vspace{2cm} \itshape In hindsight, systems governed by slowly evolving dynamics require much wider windows\\ than we expected.}
+In the case of dynamical systems, the set $x^{1:L}$ is by definition a first-order Markov chain and the minimal Markov blanket of an element $x^i$ is $x^{b_i} = \{x^{i-1}, x^{i+1}\}$. For the perturbed element $x^i_t$, the pseudo-blanket $x^{\bar{b}_i}_t$ can take the form of a window surrounding $x^i_t$, that is $\bar{b}_i = \{i-k, \dots, i+k\} \setminus \{i\}$ with $k \geq 1$. The value of $k$ is dependent on the problem, but we argue, supported by our experiments, that it is generally much smaller than the chain's length $L$. Hence, a fully convolutional neural network (FCNN) with a narrow receptive field is well suited to the task, and long-range capabilities would be wasted resources. Importantly, if the receptive field is $2k + 1$, the network can be trained on segments $x^{i-k:i+k}$ instead of the full chain $x^{1:L}$, thereby drastically reducing training costs. More generally, we can train a local score network (see Algorithm \ref{alg:training})
+\begin{equation}
+    s_\phi(x^{i-k:i+k}_t, t) \approx \grad{x^{i-k:i+k}_t} \log p(x^{i-k:i+k}_t)
+\end{equation}
+such that its $k+1$-th element approximates the score of the $i$-th state $\grad{x^i_t} \log p(x^{1:L}_t)$. We also have that the $k$ first elements of $s_\phi(x^{1:2k+1}_t, t)$ approximate the score of the $k$ first states $\grad{x^{1:k}_t} \log p(x^{1:L}_t)$ and the $k$ last elements of $s_\phi(x^{L-2k:L}_t, t)$ approximate the score of the $k$ last states $\grad{x^{L-k:L}_t} \log p(x^{1:L}_t)$. Hence, we can apply the local score network on all sub-segments $x^{i-k:i+k}_t$ of $x^{1:L}_t$, similar to a convolution kernel, and combine the outputs (see Algorithm \ref{alg:composing}) to get an approximation of the full score $\grad{x^{1:L}_t} \log p(x^{1:L}_t)$. Note that we can either condition the score network with $i$ or assume the statistical stationarity of the chain, that is $p(x^i) = p(x^{i+1})$.
+
+\begin{figure}[t]
+\begin{minipage}[t]{0.49\textwidth}%
+\vspace{-1em}
+\begin{algorithm}[H]
+    \caption{Training $\epsilon_\phi(x^{i-k:i+k}_t, t)$} \label{alg:training}
+    \begin{algorithmic}[1]
+        \For{$i = 1$ to $N$}
+            \State $x^{1:L} \sim p(x^{1:L})$
+            \State $i \sim \mathcal{U}(\{k+1, \dots, L-k\})$
+            \State $t \sim \mathcal{U}(0, 1), \epsilon \sim \mathcal{N}(0, I)$
+            \State $x^{i-k:i+k}_t \gets \alpha_t \, x^{i-k:i+k} + \sigma_t \, \epsilon$
+            \State $\displaystyle \ell \gets \| \epsilon_\phi(x^{i-k:i+k}_t, t) - \epsilon \|_2^2$
+            \State $\phi \gets \Call{GradientDescent}{\phi, \grad{\phi} \, \ell}$
+        \EndFor{}
+	\end{algorithmic}
+\end{algorithm}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.49\textwidth}%
+\vspace{-1em}
+\begin{algorithm}[H]
+    \caption{Composing $s_\phi(x^{i-k:i+k}_t, t)$} \label{alg:composing}
+    \begin{algorithmic}[1]
+        \Function{$s_\phi(x^{1:L}_t, t)$}{}
+            \State $s_{1:k+1} \gets s_\phi(x^{1:2k+1}_t, t)[:\!k + 1]$
+            \For{$i = k + 2$ to $L - k - 1$}
+                \State $s_i \gets s_\phi(x^{i-k:i+k}_t, t)[k+1]$
+            \EndFor{}
+            \State $s_{L-k:L} \gets s_\phi(x^{L-2k:L}_t, t)[k+1\!:]$
+            \State \Return{$s^{1:L}$}
+        \EndFunction{}
+	\end{algorithmic}
+\end{algorithm}
+\end{minipage}
+\end{figure}
+
+\subsection{Stable likelihood score} \label{sec:sda-sda-likelihood-score}
+
+Due to approximation and numerical errors in $\hat{x}(x_t)$, computing the score $\grad{x_t} \log p(y \mid x_t)$ with the likelihood approximation \eqref{eq:sda-likelihood-approx-dps} is very unstable, especially in the low signal-to-noise regime, that is when $\sigma_t \gg \alpha_t$. This incites \textcite{chung2023diffusion} to replace the covariance $\Sigma_y$ by the identity $I$ and rescale the likelihood score with respect to $\|y - \mathcal{A}(\hat{x}(x_t))\|$ to stabilize the sampling process. These modifications introduce a significant error in the approximation as they greatly affect the norm of the likelihood score.
+
+\sidenote{\vspace{2.5cm} \itshape This was the start of our journey towards better likelihood score approximations, which eventually led to the development of MMPS \cite{rozet2024learning}.}
+We argue that the instability is due to \eqref{eq:sda-likelihood-approx-dps} being only exact if the variance of $p(x \mid x_t)$ is null or negligible, which is not the case when $t > 0$. Instead, \textcite{adam2022posterior} and \textcite{meng2022diffusion} approximate the covariance of $p(x \mid x_t)$ with $\nicefrac{\Sigma_t}{\alpha_t^2}$, which is valid as long as the prior $p(x)$ is Gaussian with a large diagonal covariance $\Sigma_x$. We motivate in Appendix \ref{app:sda-covariance} the more general covariance approximation $\nicefrac{\sigma_t^2}{\alpha_t^2} \Gamma$, where the matrix $\Gamma$ depends on the eigendecomposition of $\Sigma_x$. Then, taking inspiration from the extended Kalman filter, we approximate the perturbed likelihood as
+\begin{equation} \label{eq:sda-likelihood-approx}
+    p(y \mid x_t) \approx \mathcal{N} \left( y \mid \mathcal{A}(\hat{x}(x_t)), \Sigma_y + \frac{\sigma_t^2}{\alpha_t^2} A \Gamma A^T \right)
+\end{equation}
+where $A = \partial_x \, \mathcal{A} \mid_{\hat{x}(x_t)}$ is the Jacobian of $\mathcal{A}$. In practice, to simplify the approximation, the term $A \Gamma A^T$ can often be replaced by a constant (diagonal) matrix. We find that computing the likelihood score $\grad{x_t} \log p(y \mid x_t)$ with this new approximation (see Algorithm \ref{alg:posterior}) is stable enough that rescaling it or ignoring $\Sigma_y$ is unnecessary.
+
+\subsection{Predictor-Corrector sampling}
+\label{sec:sda-sda-pc-sampling}
+
+To simulate the reverse SDE, we adopt the exponential integrator (EI) discretization scheme introduced by \textcite{zhang2023fast}
+\begin{equation} \label{eq:sda-predictor}
+    x_{t - \Delta t} \gets \frac{\alpha_{t - \Delta t}}{\alpha_t} x_t + \left( \frac{\alpha_{t - \Delta t}}{\alpha_t} - \frac{\sigma_{t - \Delta t}}{\sigma_t} \right) \sigma_t^2 \, s_\phi(x_t, t)
+\end{equation}
+which coincides with the deterministic DDIM \cite{song2021denoising} sampling algorithm when the variance preserving SDE \cite{ho2020denoising} is used. However, as we approximate both the prior and likelihood scores, errors accumulate along the simulation and cause it to diverge, leading to low-quality samples. To prevent errors from accumulating, we perform (see Algorithm \ref{alg:sampling}) a few steps of Langevin Monte Carlo (LMC) \cite{parisi1981correlation, grenander1994representations}
+\begin{equation} \label{eq:sda-corrector}
+    x_t \gets x_t + \delta \, s_\phi(x_t, t) + \sqrt{2 \delta} \, \epsilon
+\end{equation}
+where $\epsilon \sim \mathcal{N}(0, I)$, between each step of the discretized reverse SDE \eqref{eq:sda-predictor}. In the limit of an infinite number of LMC steps with a sufficiently small step size $\delta \in \mathbb{R}_+$, simulated samples are guaranteed to follow the distribution implicitly defined by our approximation of the posterior score at each time $t$, meaning that the errors introduced by the pseudo-blanket \eqref{eq:sda-pseudo-blanket} and likelihood \eqref{eq:sda-likelihood-approx} approximations do not accumulate. In practice, we find that few LMC steps are necessary. \textcite{song2021scorebased} introduced a similar strategy, named predictor-corrector (PC) sampling, to correct the errors introduced by the discretization of the reverse SDE.
+
+\section{Results}
+
+We demonstrate the effectiveness of score-based data assimilation on two chaotic dynamical systems: the Lorenz 1963 \cite{lorenz1963deterministic} and Kolmogorov flow \cite{chandler2013invariant} systems. The former is a simplified mathematical model for atmospheric convection. Its low dimensionality enables posterior inference using classical sequential Monte Carlo methods \cite{liu1998sequential, doucet2011tutorial} such as the bootstrap particle filter \cite{gordon1993novel}. This allows us to compare objectively our posterior approximations against the ground-truth posterior. The second system considers the state of a two-dimensional turbulent fluid subject to Kolmogorov forcing \cite{chandler2013invariant}. The evolution of the fluid is modeled by the Navier-Stokes equations, the same equations that underlie the models of oceans and atmospheres. This task provides a good understanding of how SDA would perform in typical data assimilation applications, although our analysis is primarily qualitative due to the unavailability of reliable assessment tools for systems of this scale.
+
+For both systems, we employ as diffusion process the variance preserving SDE with a cosine schedule \cite{nichol2021improved}, that is $\alpha_t = \cos(\omega t)^2$ with $\omega = \arccos \sqrt{10^{-3}}$ and $\sigma_t = \sqrt{1 - \alpha_t^2}$. The score networks are trained once and then evaluated under various observation scenarios. Unless specified otherwise, we estimate the posterior score according to Algorithm \ref{alg:posterior} with $\Gamma = \num{e-2} I$ and simulate the reverse SDE \eqref{eq:sda-reverse-sde} according to Algorithm \ref{alg:sampling} in \num{256} evenly spaced discretization steps.
+
+\subsection{Lorenz 1963}
+
+The state $x = (a, b, c) \in \mathbb{R}^3$ of the Lorenz system evolves according to a system of ordinary differential equations
+\begin{equation} \label{eq:sda-lorenz}
+\begin{aligned}
+    \dot{a} & = \sigma (b - a) \\
+    \dot{b} & = a (\rho - c) - b \\
+    \dot{c} & = ab - \beta c
+\end{aligned}
+\end{equation}
+where $\sigma = 10$, $\rho = 28$ and $\beta = \frac{8}{3}$ are parameters for which the system exhibits a chaotic behavior. We denote $\tilde{a}$ and $\tilde{c}$ the standardized (zero mean and unit variance) versions of $a$ and $c$, respectively. As our approach assumes a discrete-time stochastic dynamical system, we consider a transition process of the form $x^{i+1} = \mathcal{M}(x^i) + \eta$, where $\mathcal{M}: \mathbb{R}^3 \mapsto \mathbb{R}^3$ is the integration of the differential equations \eqref{eq:sda-lorenz} for $\Delta = \num{0.025}$ time units and $\eta \sim \mathcal{N}(0, \Delta I)$ represents Brownian noise.
+
+\begin{figure}[!t]
+    \centering
+    \includegraphics[scale=0.75]{./chapters/sda/figures/statistics.pdf}
+    \caption{Average posterior summary statistics over 64 observations from the low (\textbf{\textsf{A}}) and high (\textbf{\textsf{B}}) frequency observation processes. We observe that, as $k$ and the number of corrections $C$ increase, the statistics of the approximate posteriors get closer to the ground-truth, in red, which means they are getting more accurate. However, increasing $k$ and $C$ improves the quality of posteriors with decreasing return, such that all posteriors with $k \geq 3$ and $C \geq 2$ are almost equivalent. This is visible in \textbf{\textsf{C}}, where we display trajectories inferred ($C=2$) for an observation of the low frequency observation process. For readability, we allocate a segment of 32 states to each $k$ instead of overlapping all 192 states. Note that the Wasserstein distance between the ground-truth posterior and itself is not zero as it is estimated with a finite number (1024) of samples.}
+    \vspace{-0.5em}
+    \label{fig:statistics}
+\end{figure}
+
+We generate \num{1024} independent trajectories of \num{1024} states, which are split into training (\qty{80}{\percent}), validation (\qty{10}{\percent}) and evaluation (\qty{10}{\percent}) sets. The initial states are drawn from the statistically stationary regime of the system. We consider two score network architectures: fully-connected local score networks for small $k$ ($k \leq 4$) and fully-convolutional score networks for large $k$. Architecture and training details for each $k$ are provided in Appendix \ref{app:sda-details}.
+
+We first study the impact of $k$ (see Section \ref{sec:sda-sda-blanket}) and the number of LMC corrections (see Section \ref{sec:sda-sda-pc-sampling}) on the quality of the inferred posterior. We consider two simple observation processes $\mathcal{N}(y \mid \tilde{a}^{1:L:8}, 0.05^2 I)$ and $\mathcal{N}(y \mid \tilde{a}^{1:L}, 0.25^2 I)$. The former observes the state at low frequency (every eighth step) with low noise, while the latter observes the state at high frequency (every step) with high noise. For both processes, we generate an observation $y$ for a trajectory of the evaluation set (truncated at $L=65$) and apply the bootstrap particle filter (BPF) to draw \num{1024} trajectories $x^{1:L}$ from the ground-truth posterior $p(x^{1:L} \mid y)$. We use a large number of particles ($2^{16}$) to ensure convergence. Then, using SDA, we sample $1024$ trajectories from the approximate posterior $q(x^{1:L} \mid y)$ defined by each score network. We compare the approximate and ground-truth posteriors with three summary statistics: the expected log-prior $\mathbb{E}_{q(x^{1:L} \mid y)} [\log p(x^{2:L} \mid x^1)]$, the expected log-likelihood $\mathbb{E}_{q(x^{1:L} \mid y)} [\log p(y\mid x^{1:L})]$ and the Wasserstein distance $W_1(p, q)$ in trajectory space. We repeat the procedure for \num{64} observations and different number of corrections ($\tau = 0.25$, see Algorithm \ref{alg:sampling}) and present the results in Figure \ref{fig:statistics}. To paraphrase, SDA is able to reproduce the ground-truth posterior accurately. Interestingly, accuracy can be traded off for computational efficiency: fewer corrections leads to faster inference at the potential expense of physical consistency.
+
+Another advantage of SDA over variational data assimilation approaches is that it targets the whole posterior distribution instead of point estimates, which allows to identify when several scenarios are plausible. As a demonstration, we generate an observation from the observation process $p(y \mid x^{1:L}) = \mathcal{N}(y \mid \tilde{c}^{1:L:4}, 0.1^2 I)$ and infer plausible trajectories with SDA ($k=4$, $C=2$). Several modes are identified in the posterior, which we illustrate in Figure \ref{fig:multimodal}.
+
+\begin{figure}[!t]
+    \centering
+    \includegraphics[scale=0.75]{./chapters/sda/figures/multimodal.pdf}
+    \caption{Example of multi-modal posterior inference with SDA. We identify four modes (dashed lines) in the inferred posterior. All modes are consistent with the observation (red crosses), as demonstrated by the posterior predictive distribution $q(y' \mid y) = \mathbb{E}_{q(x^{1:L} \mid y)} [ p(y' \mid x^{1:L}) ]$.}
+    \label{fig:multimodal}
+\end{figure}
+
+\subsection{Kolmogorov flow}
+
+\begin{figure}[!b]
+    \centering
+    \includegraphics[scale=0.85]{./chapters/sda/figures/assimilation.pdf}
+    \caption{Example of sampled trajectory from coarse, intermittent and noisy observations. States are visualized by their vorticity field $\omega = \nabla \times \bm{u}$, that is the curl of the velocity field. Positive values (red) indicate clockwise rotation and negative values (blue) indicate counter-clockwise rotation. SDA closely recovers the original trajectory, despite the limited amount of available data. Replacing SDA's likelihood score approximation with the one of DPS \cite{chung2023diffusion} yields trajectories inconsistent with the observation.}
+    \label{fig:assimilation}
+\end{figure}
+
+Incompressible fluid dynamics are governed by the Navier-Stokes equations
+\begin{equation} \label{eq:sda-navier-stokes}
+\begin{aligned}
+    \dot{\bm{u}} & = - \bm{u} \nabla \bm{u} + \frac{1}{Re} \nabla^2 \bm{u} - \frac{1}{\rho} \nabla p + \bm{f} \\
+    0 & = \nabla \cdot \bm{u}
+\end{aligned}
+\end{equation}
+where $\bm{u}$ is the velocity field, $Re$ is the Reynolds number, $\rho$ is the fluid density, $p$ is the pressure field and $\bm{f}$ is the external forcing. Following \textcite{kochkov2021machine}, we choose a two-dimensional domain $[0, 2 \pi]^2$ with periodic boundary conditions, a large Reynolds number $Re = \num{e3}$, a constant density $\rho = 1$ and an external forcing $\bm{f}$ corresponding to Kolmogorov forcing with linear damping \cite{chandler2013invariant, boffetta2012twodimensional}. We use the \href{https://github.com/google/jax-cfd}{\texttt{jax-cfd}} library \cite{kochkov2021machine} to solve the Navier-Stokes equations \eqref{eq:sda-navier-stokes} on a $256 \times 256$ domain grid. The states $x^i$ are snapshots of the velocity field $\bm{u}$, coarsened to a $64 \times 64$ resolution, and the integration time between two such snapshots is $\Delta = 0.2$ time units. This corresponds to \num{82} integration steps of the forward Euler method, which would be expensive to differentiate through repeatedly, as required by gradient-based data assimilation approaches.
+
+We generate \num{1024} independent trajectories of \num{64} states, which are split into training (\qty{80}{\percent}), validation (\qty{10}{\percent}) and evaluation (\qty{10}{\percent}) sets. The initial states are drawn from the statistically stationary regime of the system. We consider a local score network with $k=2$. As states take the form of $64 \times 64$ images with two velocity channels, we use a U-Net \cite{ronneberger2015unet} inspired network architecture. Architecture and training details are provided in Appendix \ref{app:sda-details}.
+
+We first apply SDA to a classic data assimilation problem. We take a trajectory of length $L=32$ from the evaluation set and observe the velocity field every four steps, coarsened to a resolution $8 \times 8$ and perturbed by a moderate Gaussian noise ($\Sigma_y = 0.1^2 I$). Given the observation, we sample a trajectory with SDA ($C=1$, $\tau=0.5$) and find that it closely recovers the original trajectory, as illustrated in Figure \ref{fig:assimilation}. A similar experiment where we modify the amount of spatial information is presented in Figure \ref{fig:subsampling}. When data is insufficient to identify the original trajectory, SDA extrapolates a physically plausible scenario while remaining consistent with the observation, which can also be observed in Figure \ref{fig:extrapolation} and \ref{fig:saturation}.
+
+\sidenote{\vspace{-12cm} \itshape To this day, this figure remains one of our favorites. We vividly remember our excitement as we discovered the result of this silly experiment.}
+\begin{figure}[!t]
+    \centering
+    \includegraphics[scale=0.85]{./chapters/sda/figures/circle.pdf}
+    \caption{A trajectory consistent with an unlikely observation of the final state $x^L$ is generated with SDA. To verify whether the trajectory is realistic and not hallucinated, we plug its initial state $x^1$ into the physical model and obtain an almost identical trajectory. This indicates that SDA is not simply interpolating between observations, but rather propagates information in a manner consistent with the physical model, even in unlikely scenarios.}
+    \label{fig:circle}
+\end{figure}
+
+Finally, we investigate whether SDA generalizes to unlikely scenarios. We design an observation process that probes the vorticity of the final state $x^L$ in a circle-shaped sub-domain. Then, we sample a trajectory ($C=1$, $\tau = 0.5$) consistent with a uniform positive vorticity observation in this sub-domain, which is unlikely, but not impossible. The result is discussed in Figure \ref{fig:circle}.
+
+\section{Conclusion}
+
+\paragraph{Impact}
+In addition to its contributions to the field of data assimilation, this work presents new technical contributions to the field of score-based generative modeling.
+
+First, we provide new insights on how to exploit conditional independencies (Markov blankets) in sets of random variables to build and train score-based generative models. Based on these findings, we are able to generate/infer simultaneously all the states of arbitrarily long Markov chains $x^{1:L}$, while only training score models on short segments $x^{i-k:i+k}$, thereby reducing the training costs and the amounts of training data required. The decomposition of the global score into local scores additionally allows for better parallelization at inference, which could be significant depending on available hardware. Importantly, the pseudo-blanket approximation \eqref{eq:sda-pseudo-blanket} is not limited to Markov chains, but could be applied to any set of variables $x^{1:L}$, as long as some structure is known.
+
+Second, we motivate and introduce a novel approximation \eqref{eq:sda-likelihood-approx} for the perturbed likelihood $p(y \mid x_t)$, when the likelihood $p(y \mid x)$ is assumed (linear or non-linear) Gaussian. We find that computing the likelihood score $\grad{x_t} \log p(y \mid x_t)$ with this new approximation leads to accurate posterior inference, without the need for stability tricks \cite{chung2023diffusion}. This contribution can be trivially adapted to many tasks such as inpainting, deblurring, super-resolution or inverse problems in scientific fields \cite{song2022solving, adam2022posterior, chung2023diffusion}.
+
+\paragraph{Limitations}
+From a computational perspective, even though SDA does not require simulating or differentiating through the physical model, inference remains limited by the speed of the simulation of the reverse SDE. Accelerating sampling in score-based generative models is an active area of research \cite{song2021denoising, liu2022pseudo, zhang2023fast, song2023consistency} with promising results which would be worth exploring in the context of our method.
+
+Regarding the quality of our results, we empirically demonstrate that SDA provides accurate approximations of the whole posterior, especially as $k$ and the number of LMC corrections $C$ increase. However, our approximations \eqref{eq:sda-pseudo-blanket} and \eqref{eq:sda-likelihood-approx} introduce a certain degree of error, which precise impact on the resulting posterior remains to be theoretically quantified. Furthermore, although the Kolmogorov system is high-dimensional (tens of thousands of dimensions) with respect to what is approachable with classical posterior inference methods, it remains small in comparison to the millions of dimensions of some operational DA systems. Whether SDA would scale well to such applications is an open question and will present serious engineering challenges.
+
+Another limitation of our work is the assumption that the dynamics of the system are shared by all trajectories. In particular, if a parametric physical model is used, all trajectories are assumed to share the same parameters. For this reason, SDA is not applicable to settings where fitting the model parameters is also required, or at least not without further developments. Some approaches \cite{archer2015black, maddison2017filtering, naesseth2018variational, lawson2022sixo} tackle this task, but they remain limited to low-dimensional settings. Additionally, if a physical model is used to generate synthetic training data, instead of relying on real data, one can only expect SDA to be as accurate as the model itself. This is a limitation shared by any model-based approach and robust assimilation under model misspecification or distribution shift is left as an avenue for future research.
+
+Finally, posterior inference over entire state trajectories is not always necessary. In forecasting tasks, inferring the current state of the dynamical system is sufficient and likely much less expensive. In this setting, data assimilation reduces to a state estimation problem for which classical methods such as the Kalman filter \cite{kalman1960new} or its nonlinear extensions \cite{wan2000unscented, arasaratnam2009cubature} provide strong baselines. Many deep learning approaches have also been proposed to bypass the physical model entirely and learn instead a generative model of plausible forecasts from past observations only \cite{krishnan2015deep, girin2021dynamical, ravuri2021skilful, lam2023learning}.
+
+\paragraph{Related work}
+A number of previous studies have investigated the use of deep learning to improve the quality and efficiency of data assimilation. \textcite{mack2020attentionbased} use convolutional auto-encoders to project the variational data assimilation problem into a lower-dimensional space, which simplifies the optimization problem greatly.
+\textcite{frerix2021variational} use a deep neural network to predict the initial state of a trajectory given the observations. This prediction is then used as a starting point for traditional (4D-Var) variational data assimilation methods, which proves to be more effective than starting at random. This strategy is also possible with SDA (using a trajectory sampled with SDA as a starting point) and could help cover multiple modes of the posterior distribution. Finally, \textcite{brajard2020combining} address the problem of simultaneously learning the transition dynamics and estimating the trajectory, when only the observation process is known.
+
+Beyond data assimilation, SDA closely relates to the broader category of sequence models, which have been studied extensively for various types of data, including text, audio, and video. The latest advances demonstrate that score-based generative models achieve remarkable results on the most demanding tasks. \textcite{kong2021diffwave} and \textcite{goel2022its} use score-based models to generate long audio sequences non-autoregressively. \textcite{ho2022video} train a score-based generative model for a fixed number of video frames and use it autoregressively to generate videos of arbitrary lengths. Conversely, our approach is non-autoregressive which allows to generate and condition all elements (frames) simultaneously. Interestingly, as part of their method, \textcite{ho2022video} introduce \enquote{reconstruction guidance} for conditional sampling, which can be seen as a special case of our likelihood approximation \eqref{eq:sda-likelihood-approx} where the observation $y$ is a subset of $x$. Lastly, \textcite{ho2022imagen} generate low-frame rate, low-resolution videos which are then up-sampled temporally and spatially with a cascade \cite{ho2022cascaded} of super-resolution diffusion models. The application of this approach to data assimilation could be worth exploring, although the introduction of arbitrary observation processes seems challenging.
+
+\section*{Acknowledgments}
+
+François Rozet is a research fellow of the F.R.S.-FNRS (Belgium) and acknowledges its financial support.
+
+\clearpage
+\section*{References}
+
+\printbibliography[heading=none]
+
+\begin{subappendices}
+
+\clearpage
+\section{Unbiased pseudo-blanket approximation} \label{app:sda-unbiased}
+
+For any continuous random variables $a$, $b$ and $c$,
+\begin{align*}
+    \grad{a} \log p(a, b) & = \frac{1}{p(a, b)} \grad{a} \, p(a, b) \\
+    & = \frac{1}{p(a, b)} \grad{a} \int p(a, b, c) \d{c} \\
+    & = \int \frac{p(c \mid a, b)}{p(a, b, c)} \grad{a} \, p(a, b, c) \d{c} \\
+    & = \mathbb{E}_{p(c \mid a, b)} \big[ \grad{a} \log p(a, b, c) \big] \, .
+\end{align*}
+Replacing $a$, $b$ and $c$ by $x^i_t$, $x^{\bar{b}_i}_t$ and $x^{\not\in}_t = \{ x^{j}_t : j \neq i \wedge j \not\in \bar{b}_i \}$, respectively, we obtain
+\begin{equation*}
+    \grad{x^i_t} \log p(x^i_t, x^{\bar{b}_i}_t) = \mathbb{E}_{p(x^{\not\in}_t \mid x^i_t, x^{\bar{b}_i}_t)} \big[ \grad{x^i_t} \log p(x^{1:L}_t) \big] \, ,
+\end{equation*}
+meaning that $\grad{x^i_t} \log p(x^i_t, x^{\bar{b}_i}_t)$ is the expected value of $\grad{x^i_t} \log p(x^{1:L}_t)$ over $x^{\not\in}_t$. In other words, regardless of the elements or the size of $\bar{b}_i$, $\grad{x^i_t} \log p(x^i_t, x^{\bar{b}_i}_t)$ is an unbiased (exact in expectation) estimate of $\grad{x^i_t} \log p(x^{1:L}_t)$.
+
+\section{On the covariance of $p(x \mid x_t)$} \label{app:sda-covariance}
+
+Assuming a Gaussian prior $p(x)$ with covariance $\Sigma_x$, the covariance $\hat{\Sigma}$ of $p(x \mid x_t)$ takes the form
+\begin{align*}
+    \hat{\Sigma} & = \Sigma_x - \Sigma_x \left(\Sigma_x + \frac{\sigma_t^2}{\alpha_t^2} I \right)^{-1} \Sigma_x \\
+    & = \frac{\sigma_t^2}{\alpha_t^2} Q \Lambda \left(\Lambda + \frac{\sigma_t^2}{\alpha_t^2} I \right)^{-1} Q^{-1}
+\end{align*}
+where $Q \Lambda Q^{-1}$ is the eigendecomposition of $\Sigma_x$. We observe that for most of the perturbation time $t$, the central diagonal term is close to $\Lambda (\Lambda + I)^{-1}$. We therefore propose the covariance approximation
+\begin{align*}
+    \hat{\Sigma} & = \frac{\sigma_t^2}{\alpha_t^2} \Gamma
+\end{align*}
+where $\Gamma = Q \Lambda \left(\Lambda + I\right)^{-1} Q^{-1}$ is a positive semi-definite matrix.
+
+\clearpage
+\section{Algorithms} \label{app:sda-aglorithms}
+
+\begin{algorithm}[!h]
+    \caption{Estimating the posterior score $\grad{x_t} \log p(x_t \mid y)$} \label{alg:posterior}
+    \begin{algorithmic}[1]
+        \Function{$s_\phi(x_t, t \mid y)$}{}
+            \State $s_x \gets s_\phi(x_t, t)$
+            \State $\hat{x} \gets \frac{x_t + \sigma_t^2 \, s_x}{\alpha_t}$
+            \State $s_y \gets \grad{x_t} \log \mathcal{N} \left(y \mid \mathcal{A}(\hat{x}), \Sigma_y + \frac{\sigma_t^2}{\alpha_t^2} \Gamma \right)$
+            \State \Return{$s_x + s_y$}
+        \EndFunction{}
+	\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[!h]
+    \caption{Predictor-Corrector sampling from $s_\phi(x_t, t \mid y)$} \label{alg:sampling}
+    \begin{algorithmic}[1]
+        \Function{Sample}{$\{t_i\}_{i=0}^N, C, \tau$}
+    	    \State{$x_1 \sim \mathcal{N}(0, \Sigma_1)$}
+    	    \For{$i = N$ to $1$}
+                \State $x_{t_{i-1}} \gets \frac{\alpha_{t_{i-1}}}{\alpha_{t_i}} x_{t_i} + \left( \frac{\alpha_{t_{i-1}}}{\alpha_{t_i}} - \frac{\sigma_{t_{i-1}}}{\sigma_{t_i}} \right) \sigma_{t_i}^2 \, s_\phi(x_{t_i}, t_i \mid y)$
+                \For{$j = 1$ to $C$}
+                    \State $\epsilon \sim \mathcal{N}(0, I)$
+                    \State $s \gets s_\phi(x_{t_{i-1}}, t_{i-1} \mid y)$
+                    \State $\delta \gets \tau \frac{\dim(s)}{\| s \|_2^2}$
+                    \State $x_{t_{i-1}} \gets x_{t_{i-1}} + \delta \, s + \sqrt{2 \delta} \, \epsilon$
+                \EndFor
+            \EndFor
+            \State \Return{$x_0$}
+        \EndFunction{}
+	\end{algorithmic}
+\end{algorithm}
+
+\clearpage
+\section{Experiment details} \label{app:sda-details}
+
+\paragraph{Resources} Experiments were conducted with the help of a cluster of GPUs. In particular, score networks were trained and evaluated concurrently, each on a single GPU with at least \qty{11}{\giga B} of memory.
+
+\paragraph{Lorenz 1963}
+We consider two score network architectures: fully-connected local score networks for small $k$ ($k \leq 4$) and fully-convolutional score networks for large $k$ ($k > 4$). Residual blocks \cite{he2016deep}, SiLU \cite{elfwing2018sigmoidweighted} activation functions and layer normalization \cite{ba2016layer} are used for both architecture. The number of blocks in the fully-convolutional architecture controls the value of $k$. We train all score networks for 1024 epochs with the AdamW \cite{loshchilov2019decoupled} optimizer and a linearly decreasing learning rate. Other hyperparameters are provided in Table \ref{tab:hyperparams-lorenz}.
+
+\begin{table}[!h]
+    \centering
+    \caption{Score network hyperparameters for the Lorenz experiment.}
+    \label{tab:hyperparams-lorenz}
+    \begin{tabular}{lcc}
+        \toprule
+        Hyperparameter & $k \leq 4$ & $k > 4$ \\
+        \midrule
+        Architecture & fully-connected & fully-convolutional \\
+        Residual blocks & 5 & $k - 2$ \\
+        Features/channels & 256 & 64 \\
+        Kernel size & -- & 3 \\
+        Activation & SiLU & SiLU \\
+        Normalization & LayerNorm & LayerNorm \\
+        \midrule
+        Optimizer & AdamW & AdamW \\
+        Weight decay & \num{e-3} & \num{e-3} \\
+        Learning rate & \num{e-3} & \num{e-3} \\
+        Scheduler & linear & linear \\
+        Epochs & 1024 & 1024 \\
+        Batches per epoch & 256 & 256 \\
+        Batch size & 256 & 64 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\paragraph{Kolmogorov flow}
+The local score network is a U-Net \cite{ronneberger2015unet} with residual blocks \cite{he2016deep}, SiLU \cite{elfwing2018sigmoidweighted} activation functions and layer normalization \cite{ba2016layer}. This architecture is motivated by the locality of the Navier-Stokes equations, which impose that the evolution of a drop of fluid is determined by its immediate environment. This can be seen as an application of the pseudo-blanket approximation \eqref{eq:sda-pseudo-blanket} to a grid-structured set of random variables. We train the score network for 1024 epochs with the AdamW \cite{loshchilov2019decoupled} optimizer and a linearly decreasing learning rate. Other hyperparameters are provided in Table \ref{tab:hyperparams-kolmogorov}.
+
+\begin{table}[!h]
+    \centering
+    \caption{Score network hyperparameters for the Kolmogorov experiment.}
+    \label{tab:hyperparams-kolmogorov}
+    \begin{tabular}{lcc}
+        \toprule
+        Architecture & U-Net \\
+        Residual blocks per level & $(3, 3, 3)$ \\
+        Channels per level & $(96, 192, 384)$ \\
+        Kernel size & 3 \\
+        Padding & circular \\
+        Activation & SiLU \\
+        Normalization & LayerNorm \\
+        \midrule
+        Optimizer & AdamW \\
+        Weight decay & \num{e-3} \\
+        Learning rate & \num{2e-4} \\
+        Scheduler & linear \\
+        Epochs & 1024 \\
+        Batches per epoch & 128 \\
+        Batch size & 32 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\clearpage
+\section{Assimilation examples} \label{app:sda-examples}
+
+\vfill{}
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[scale=0.85]{./chapters/sda/figures/extrapolation.pdf}
+    \caption{Example of sampled trajectory when the observation is insufficient to identify the original trajectory. The observation is the center of the velocity field every three steps, coarsened to a resolution $8 \times 8$ and perturbed by a small Gaussian noise ($\Sigma_y = 0.01^2 I$). SDA ($C=1$, $\tau=0.5$) identifies the original state where data is sufficient, while generating physically plausible states elsewhere. Replacing SDA's likelihood score approximation with the one of DPS \cite{chung2023diffusion} yields a trajectory less consistent with the observation.}
+    \label{fig:extrapolation}
+\end{figure}
+
+\vfill{}
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[scale=0.85]{./chapters/sda/figures/saturation.pdf}
+    \caption{Example of sampled trajectory when the observation process is non-linear. The observation corresponds to a saturating transformation $x \mapsto \frac{x}{1 + |x|}$ of the vorticity field $\omega$. SDA (512 discretization steps, $C=1$, $\tau=0.5$) identifies the original state where data is sufficient, while generating physically plausible states elsewhere. Replacing SDA's likelihood score approximation with the one of DPS \cite{chung2023diffusion} yields a trajectory inconsistent with the observation.}
+    \label{fig:saturation}
+\end{figure}
+
+\vfill{}
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[scale=0.85]{./chapters/sda/figures/subsampling.pdf}
+    \caption{Example of sampled trajectories when the observation is spatially sparse. The observation $y_{\div_{n}}$ corresponds to a spatial subsampling of factor $n$ of the velocity field. SDA ($C=1$, $\tau=0.5$) closely recovers the original trajectory for all factors $n$, despite the limited amount of available data. Replacing SDA's likelihood score approximation with the one of DPS \cite{chung2023diffusion} leads to trajectories that are progressively less consistent with the observation as $n$ increases.}
+    \label{fig:subsampling}
+\end{figure}
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[scale=0.85]{./chapters/sda/figures/extra_bis.pdf}
+    \caption{Example of sampled trajectories when the observation is insufficient to identify the original trajectory. The observation is the center of the velocity field every three steps, coarsened to a resolution $8 \times 8$ and perturbed by a small Gaussian noise ($\Sigma_y = 0.01^2 I$). SDA ($C=1$, $\tau=0.5$) identifies the original state where data is sufficient, while generating physically plausible states elsewhere.}
+    \label{fig:extrapolation-bis}
+\end{figure}
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[scale=0.85]{./chapters/sda/figures/sub_bis.pdf}
+    \caption{Example of sampled trajectories when the observation is spatially sparse. The observation $y$ corresponds to a spatial subsampling of factor $16$ of the velocity field with medium Gaussian noise ($\Sigma_y = 0.1^2 I$). SDA ($C=1$, $\tau=0.5$) generates trajectories similar to the original, with physically plausible variations.}
+    \label{fig:subsampling-bis}
+\end{figure}
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.85\textwidth]{./chapters/sda/figures/x_loop.png}
+    \caption{Example of long ($L=127$) sampled trajectory. Odd states are displayed from left to right and from top to bottom. The observation process probes the difference between the initial and final states and the observation is set to zero, which enforces a looping trajectory ($x^1 \approx x^L$). Note that this scenario is not realistic and will therefore lead to physically implausible trajectories.}
+    \label{fig:loop}
+\end{figure}
+
+\end{subappendices}

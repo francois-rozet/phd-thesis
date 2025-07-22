@@ -1,0 +1,47 @@
+\documentclass[margin=0]{standalone}
+
+\usepackage{tikz}
+\usetikzlibrary{positioning}
+\tikzset{
+    every node/.style={align=center},
+}
+
+\begin{document}
+\begin{tikzpicture}
+    % Images
+    \node[anchor=west, inner sep=0] at (0, 0.0) {\includegraphics[height=1.75cm]{img/x_star_sub.png}};
+    \node[anchor=west, inner sep=0] at (0, -1.65) {\includegraphics[height=1.75cm]{img/y_star_sub_2.png}};
+    \node[anchor=west, inner sep=0] at (0, -3.3) {\includegraphics[height=1.75cm]{img/x_sda_sub_2.png}};
+    \node[anchor=west, inner sep=0] at (0, -4.95) {\includegraphics[height=1.75cm]{img/x_dps_sub_2.png}};
+
+    \node[anchor=west, inner sep=0] at (0, -6.65) {\includegraphics[height=1.75cm]{img/y_star_sub_4.png}};
+    \node[anchor=west, inner sep=0] at (0, -8.3) {\includegraphics[height=1.75cm]{img/x_sda_sub_4.png}};
+    \node[anchor=west, inner sep=0] at (0, -9.95) {\includegraphics[height=1.75cm]{img/x_dps_sub_4.png}};
+
+    \node[anchor=west, inner sep=0] at (0, -11.65) {\includegraphics[height=1.75cm]{img/y_star_sub_8.png}};
+    \node[anchor=west, inner sep=0] at (0, -13.3) {\includegraphics[height=1.75cm]{img/x_sda_sub_8.png}};
+    \node[anchor=west, inner sep=0] at (0, -14.95) {\includegraphics[height=1.75cm]{img/x_dps_sub_8.png}};
+
+    \node[anchor=west, inner sep=0] at (0, -16.65) {\includegraphics[height=1.75cm]{img/y_star_sub_16.png}};
+    \node[anchor=west, inner sep=0] at (0, -18.3) {\includegraphics[height=1.75cm]{img/x_sda_sub_16.png}};
+    \node[anchor=west, inner sep=0] at (0, -19.95) {\includegraphics[height=1.75cm]{img/x_dps_sub_16.png}};
+
+    % Text
+    \node[rotate=90] at (-0.15, 0.0) {$x^{1:L}$};
+    \node[rotate=90] at (-0.15, -1.65) {$y_{\div_2}$};
+    \node[rotate=90] at (-0.15, -3.3) {\small SDA};
+    \node[rotate=90] at (-0.15, -4.95) {\small DPS};
+
+    \node[rotate=90] at (-0.15, -6.65) {$y_{\div_4}$};
+    \node[rotate=90] at (-0.15, -8.3) {\small SDA};
+    \node[rotate=90] at (-0.15, -9.95) {\small DPS};
+
+    \node[rotate=90] at (-0.15, -11.65) {$y_{\div_8}$};
+    \node[rotate=90] at (-0.15, -13.3) {\small SDA};
+    \node[rotate=90] at (-0.15, -14.95) {\small DPS};
+
+    \node[rotate=90] at (-0.15, -16.65) {$y_{\div_{16}}$};
+    \node[rotate=90] at (-0.15, -18.3) {\small SDA};
+    \node[rotate=90] at (-0.15, -19.95) {\small DPS};
+\end{tikzpicture}
+\end{document}

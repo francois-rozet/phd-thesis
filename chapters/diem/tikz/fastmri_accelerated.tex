@@ -1,0 +1,28 @@
+\documentclass[margin=0cm]{standalone}
+
+\PassOptionsToPackage{dvipsnames}{xcolor}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta}
+\usetikzlibrary{calc}
+\tikzset{
+    every node/.style={align=center},
+}
+
+\begin{document}
+\begin{tikzpicture}
+    \node[inner sep=0, anchor=north west] at (0, 0) {\includegraphics[width=15cm]{fastmri_accelerated.png}};
+
+    \node[inner sep=1] at (1.5, 0.25) {Mask $m$};
+    \node[inner sep=1] at (4.5, 0.25) {$\mathcal{F}^{-1}(m \odot y)$};
+    \node[inner sep=1] at (7.5, 0.25) {Sample 1};
+    \node[inner sep=1] at (10.5, 0.25) {Sample 2};
+    \node[inner sep=1] at (13.5, 0.25) {Ground-truth};
+
+    \node[inner sep=1, rotate=90] at (-0.25, -1.5) {$R = 4$};
+    \node[inner sep=1, rotate=90] at (-0.25, -4.5) {$R = 8$};
+    \node[inner sep=1, rotate=90] at (-0.25, -7.5) {$R = 16$};
+    \node[inner sep=1, rotate=90] at (-0.25, -10.5) {$R = 32$};
+\end{tikzpicture}
+\end{document}

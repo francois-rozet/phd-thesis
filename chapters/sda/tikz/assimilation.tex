@@ -1,0 +1,23 @@
+\documentclass[margin=0]{standalone}
+
+\usepackage{tikz}
+\usetikzlibrary{positioning}
+\tikzset{
+    every node/.style={align=center},
+}
+
+\begin{document}
+\begin{tikzpicture}
+    % Images
+    \node[anchor=west, inner sep=0] at (0, 0.0) {\includegraphics[height=1.75cm]{img/x_star_assim.png}};
+    \node[anchor=west, inner sep=0] at (0, -1.65) {\includegraphics[height=1.75cm]{img/y_star_assim.png}};
+    \node[anchor=west, inner sep=0] at (0, -3.3) {\includegraphics[height=1.75cm]{img/x_sda_assim.png}};
+    \node[anchor=west, inner sep=0] at (0, -4.95) {\includegraphics[height=1.75cm]{img/x_dps_assim.png}};
+
+    % Text
+    \node[rotate=90] at (-0.15, 0.0) {$x^{1:L:4}$};
+    \node[rotate=90] at (-0.15, -1.65) {$y$};
+    \node[rotate=90] at (-0.15, -3.3) {\small SDA};
+    \node[rotate=90] at (-0.15, -4.95) {\small DPS};
+\end{tikzpicture}
+\end{document}

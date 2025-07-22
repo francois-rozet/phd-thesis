@@ -1,0 +1,38 @@
+\documentclass[margin=0cm]{standalone}
+
+\PassOptionsToPackage{dvipsnames}{xcolor}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta}
+\usetikzlibrary{calc}
+\tikzset{
+    every node/.style={align=center},
+}
+
+\begin{document}
+\begin{tikzpicture}[y=-1cm]
+    \foreach \i / \task in {0/inpainting_box, 1/inpainting_random, 2/motion_deblur, 3/super_resolution} {
+        \node at (0, 3 * \i) {\includegraphics[height=2.9cm]{ffhq/00\i.png}};
+        \node at (3, 3 * \i) {\includegraphics[height=2.9cm]{ffhq/\task_dps_10_00\i_measurement.png}};
+
+        \foreach \j / \method in {0/pgdm_10, 1/pgdm_100, 2/pgdm_1000, 3/tmpd_10, 4/tmpd_100, 5/tmpd_1000} {
+            \node at (6 + 3 * \j, 3 * \i) {\includegraphics[height=2.9cm]{ffhq/\task_\method_00\i_prediction.png}};
+        }
+    }
+
+    \node[anchor=south] at (0.0, -1.5) {Reference};
+    \node[anchor=south] at (3.0, -1.5) {Observation};
+    \node[anchor=south] at (6.0, -1.5) {$\Pi$GDM\\10 steps};
+    \node[anchor=south] at (9.0, -1.5) {$\Pi$GDM\\100 steps};
+    \node[anchor=south] at (12.0, -1.5) {$\Pi$GDM\\1000 steps};
+    \node[anchor=south] at (15.0, -1.5) {TMPD\\10 steps};
+    \node[anchor=south] at (18.0, -1.5) {TMPD\\100 steps};
+    \node[anchor=south] at (21.0, -1.5) {TMPD\\1000 steps};
+
+    \node[anchor=south, rotate=90] at (-1.5, 0.0) {Box inpainting};
+    \node[anchor=south, rotate=90] at (-1.5, 3.0) {Rand inpainting};
+    \node[anchor=south, rotate=90] at (-1.5, 6.0) {Motion deblur};
+    \node[anchor=south, rotate=90] at (-1.5, 9.0) {Super resolution};
+\end{tikzpicture}
+\end{document}

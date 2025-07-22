@@ -1,0 +1,26 @@
+\documentclass[margin=0cm]{standalone}
+
+\PassOptionsToPackage{dvipsnames}{xcolor}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta}
+\usetikzlibrary{calc}
+\tikzset{
+    every node/.style={align=center, font=\footnotesize},
+}
+
+\begin{document}
+\begin{tikzpicture}
+    \node[inner sep=0, anchor=north west] at (0, 0) {\includegraphics[width=16cm]{cifar_prior_proud-glitter-18_ju7gfg9d.png}};
+
+    \node[inner sep=1, rotate=90] at (-0.25, -0.5) {$y$};
+    \node[inner sep=1, rotate=90] at (-0.25, -1.5) {$k = 1$};
+    \node[inner sep=1, rotate=90] at (-0.25, -2.5) {$k = 2$};
+    \node[inner sep=1, rotate=90] at (-0.25, -3.5) {$k = 4$};
+    \node[inner sep=1, rotate=90] at (-0.25, -4.5) {$k = 8$};
+    \node[inner sep=1, rotate=90] at (-0.25, -5.5) {$k = 16$};
+    \node[inner sep=1, rotate=90] at (-0.25, -6.5) {$k = 32$};
+    \node[inner sep=1, rotate=90] at (-0.25, -7.5) {$x$};
+\end{tikzpicture}
+\end{document}

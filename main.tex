@@ -1,0 +1,120 @@
+\documentclass[a4paper, 10pt, oneside, openright]{book}
+
+\usepackage[english]{babel}
+\usepackage{sleek}
+
+%%%%%%%%%%%%%%
+% Title-page %
+%%%%%%%%%%%%%%
+
+\title{Generative Modeling in Large-scale Dynamical Systems}
+\author{François \textsc{Rozet}}
+\date{\today}
+
+%%%%%%%%%%%%%%%%
+% Bibliography %
+%%%%%%%%%%%%%%%%
+
+\addbibresource{./bibliography/library.bib}
+
+%%%%%%%%%%%%
+% Document %
+%%%%%%%%%%%%
+
+\begin{document}
+
+\newgeometry{margin=2.5cm}
+
+\begin{titlepage}
+    \centering
+    \hfill
+    \vfill
+    {\huge\scshape Generative Modeling in\\[1ex] Large-scale Dynamical Systems} \\[1.5cm]
+    {\LARGE François \textsc{Rozet}} \\[2ex]
+    {\Large\itshape advised by} \\[2ex]
+    {\LARGE Gilles \textsc{Louppe}}
+    \vfill
+    {\large Submitted in partial fulfilment of the requirements\\[0.5ex] for the degree of Doctor of Philosophy} \\[2ex]
+    {\large\itshape to the} \\[2ex]
+    {\large Department of Electrical Engineering and Computer Science\\[0.5ex] University of Liège}
+    \vfill
+    {\large\today}
+    \hfill
+\end{titlepage}
+
+\restoregeometry
+
+\frontmatter
+
+\hfill
+\vfill
+
+\textit{Les questions les plus importantes de la vie ne sont, pour la plupart, que des problèmes de probabilitié. On peut même dire que presque toutes nos connaissances ne sont que probables; et dans le petit nombre des choses que nous pouvons savoir avec certitude, les principaux moyens de parvenir à la vérité -- l'induction et l'analogie -- se fondent sur les probabilités, de sorte que le système entier des connaissances humaines se rattache à la théorie des probabilités.}
+
+\begin{flushright}
+    --- Pierre-Simon Laplace (1820)
+\end{flushright}
+
+\vfill
+\hfill
+
+\chapter*{Jury}
+
+{\large Marc \textsc{Bocquet}} \\
+Professor at École des Ponts
+
+{\large Pierre \textsc{Geurts}} \\
+Professor at the Univerity of Liège
+
+{\large Philipp \textsc{Hennig}} \\
+Professor at the University of Tübingen
+
+{\large Gilles \textsc{Louppe} (Advisor)} \\
+Professor at the Univerity of Liège
+
+{\large Antoine \textsc{Wehenkel}} \\
+Research Scientist at Apple Inc.
+
+{\large Louis \textsc{Wehenkel} (President)} \\
+Professor at the Univerity of Liège
+
+\chapter*{Abstract}
+
+To understand nature is, in part, to predict how it evolves. However, prediction is inherently limited by the uncertainty present in models, states, and observations. Rather than concealing this uncertainty, probabilistic modeling embraces it to produce predictions that are scientifically trustworthy and actionable. This thesis investigates how generative models, notably diffusion models, can serve as probabilistic backbones for large-scale inference problems in physics, particularly in systems whose state evolves with time, known as dynamical systems. We explore, through a series of peer-reviewed publications, multiple facets of probabilistic modeling and dynamical systems, including state estimation, forecasting, reduced-order modeling, and learning from corrupted observations. Our work establishes diffusion models as a promising alternative to classical inference methods and demonstrates that generative models can replicate, discover, and abstract the dynamics of our universe, solely from data.
+
+\include{./chapters/ack.tex}
+
+\tableofcontents
+
+\mainmatter
+
+\newgeometry{margin=2.5cm, footskip=1cm, includefoot}
+\cleardoublepage
+\part{Prologue} \label{part:prologue}
+\restoregeometry
+
+\include{./chapters/introduction.tex}
+
+\newgeometry{margin=2.5cm, footskip=1cm, includefoot}
+\cleardoublepage
+\part{Matter} \label{part:matter}
+\restoregeometry
+
+\include{./chapters/sda/main.tex}
+\include{./chapters/sda_2lqg/main.tex}
+\include{./chapters/diem/main.tex}
+\include{./chapters/lola/main.tex}
+\include{./chapters/appa/main.tex}
+
+\newgeometry{margin=2.5cm, footskip=1cm, includefoot}
+\cleardoublepage
+\part{Epilogue} \label{part:epilogue}
+\restoregeometry
+
+\include{./chapters/conclusion.tex}
+
+\backmatter
+
+% \include{./chapters/quotes.tex}
+
+\end{document}

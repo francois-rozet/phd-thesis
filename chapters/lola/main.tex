@@ -1,0 +1,1017 @@
+\chapter{Lost in Latent Space} \label{chap:lola}
+
+\begin{quote}
+    \textit{Data becomes temporarily interesting to some self-improving, but computationally limited, subjective observer once they learn to predict or compress the data in a better way, thus making it subjectively simpler and more beautiful.}
+
+    \begin{flushright}
+        --- Jürgen Schmidhuber (2009) \nocite{schmidhuber2009driven}
+    \end{flushright}
+\end{quote}
+
+\vspace{2em}
+
+\begin{addendum}{\Large\scshape Addendum}
+
+This chapter has previously been published as
+
+\begin{itemize}[leftmargin=1em]
+    \item[] \fullcite{rozet2025lost}.
+\end{itemize}
+
+This project was conducted as part of an internship with Polymathic at the Flatiron Institute. The initial goal of the project, training latent diffusion models on physics data, was decided by François R., François L., Ruben, and Michael. As the leading author, François R. conducted the experiments, interpreted the results, and wrote the manuscript. Ruben, Michael, and Gilles offered guidance, suggested experiments, and participated in the writing and literature review. François L. and Shirley provided supervision and funding.
+
+For the version presented in this chapter, we have slightly modified the placement of figures with respect to the original publication. The content remains otherwise unchanged.
+
+\end{addendum}
+
+\section*{Abstract}
+
+The steep computational cost of diffusion models at inference hinders their use as fast physics emulators. In the context of image and video generation, this computational drawback has been addressed by generating in the latent space of an autoencoder instead of the pixel space. In this work, we investigate whether a similar strategy can be effectively applied to the emulation of dynamical systems and at what cost. We find that the accuracy of latent-space emulation is surprisingly robust to a wide range of compression rates (up to $1000\times$). We also show that diffusion-based emulators are consistently more accurate than non-generative counterparts and compensate for uncertainty in their predictions with greater diversity. Finally, we cover practical design choices, spanning from architectures to optimizers, that we found critical to train latent-space emulators.
+
+\section{Introduction} \label{sec:lola-introduction}
+
+Numerical simulations of dynamical systems are at the core of many scientific and engineering disciplines. Solving partial differential equations (PDEs) that describe the dynamics of physical phenomena enables, among others, weather forecasts \cite{ecmwf2024ifs, han2011revision}, predictions of solar wind and flares \cite{hundhausen1969numerical, mariska1989numerical, wang2013magnetohydrodynamics}, or control of plasma in fusion reactors \cite{dnestrovskii1986numerical, suzen2005numerical}. These simulations typically operate on fine-grained spatial and temporal grids and require significant computational resources for high-fidelity results.
+
+To address this limitation, a promising strategy is to develop neural network-based emulators to make predictions orders of magnitude faster than traditional numerical solvers. The typical approach \cite{tompson2017accelerating, sanchez-gonzalez2020learning, pfaff2021learning, brandstetter2022message, stachenfeld2022learned, kovachki2023neural, lam2023learning, mccabe2024multiple, herde2024poseidon, morel2025disco} is to consider the dynamics as a function $f(x^i) = x^{i+1}$ that evolves the state $x^i$ of the system and to train a neural network $f_\phi(x)$ to approximate that function. In the context of PDEs, this network is sometimes called a neural solver \cite{brandstetter2022message, lippe2023pderefiner, kohl2024benchmarking}. After training, the autoregressive application of the solver, or rollout, emulates the dynamics.
+However, recent studies \cite{brandstetter2022message, list2022learned, mccabe2023stability, lippe2023pderefiner, kohl2024benchmarking} reveal that, while neural solvers demonstrate impressive accuracy for short-term prediction, errors accumulate over the course of the rollout, leading to distribution shifts between training and inference. This phenomenon is even more severe for stochastic or undetermined systems, where it is not possible to predict the next state given the previous one(s) with certainty. Instead of modeling the uncertainty, neural solvers produce a single point estimate, usually the mean, instead of a distribution.
+
+The natural choice to alleviate these issues are generative models, in particular diffusion models, which have shown remarkable results in recent years. Following their success, diffusion models have been applied to emulation tasks \cite{lippe2023pderefiner, cachay2023dyffusion, shysheya2024conditional, kohl2024benchmarking, huang2024diffusionpde, price2025probabilistic} for which they were found to mitigate the rollout instability of non-generative emulators. However, diffusion models are much more expensive than deterministic alternatives at inference, due to their iterative sampling process, which defeats the purpose of using an emulator. To address this computational drawback, many works in the image and video generation literature~\cite{rombach2022highresolution, peebles2023scalable, esser2024scaling, karras2024analyzing, xie2025sana, chen2025deep, polyak2024movie} consider generating in the latent space of an autoencoder. This approach has been adapted with success to the problem of emulating dynamical systems \cite{gao2023prediff, du2024conditional, zhou2025text2pde, li2025generative, andry2025appa}, sometimes even outperforming pixel-space emulation. In this work, we seek to answer a simple question: \emph{What is the impact of latent-space compression on emulation accuracy?} To this end, we train and systematically evaluate latent-space emulators across a wide range of compression rates for challenging dynamical systems from TheWell \cite{ohana2024well}. Our results indicate that
+\begin{enumerate}[label=\roman*., leftmargin=*]
+    \item Latent diffusion-based emulation is surprisingly robust to the compression rate, even when autoencoder reconstruction quality greatly degrades.
+    \item Latent-space emulators match or exceed the accuracy of pixel-space emulators, while using fewer parameters and less training compute.
+    \item Diffusion-based emulators consistently outperform their non-generative counterparts in both accuracy and plausibility of the emulated dynamics.
+\end{enumerate}
+
+Finally, we dedicate part of this manuscript to design choices. We discuss architectural and modeling decisions for autoencoders and diffusion models that enable stable training of latent-space emulators under high compression. To encourage further research in this direction, we provide the code for all experiments along pre-trained model weights at \url{https://github.com/polymathicai/lola}.
+
+\section{Diffusion models} \label{sec:lola-diffusion}
+
+The primary purpose of diffusion models (DMs) \cite{sohl-dickstein2015deep, ho2020denoising}, also known as score-based generative models \cite{song2019generative, song2021scorebased}, is to generate plausible data from a distribution $p(x)$ of interest. Formally, continuous-time diffusion models define a series of increasingly noisy distributions
+\begin{equation}
+    p(x_t) = \int p(x_t \mid x) \, p(x) \d{x} = \int \mathcal{N}(x_t \mid \alpha_t \, x, \sigma_t^2 I) \, p(x) \d{x}
+\end{equation}
+such that the ratio $\nicefrac{\alpha_t}{\sigma_t} \in \mathbb{R}_+$ is monotonically decreasing with the time $t \in [0, 1]$. For such a series, there exists a family of reverse-time stochastic differential equations (SDEs) \cite{anderson1982reversetime, sarkka2019applied, song2021scorebased}
+\begin{equation} \label{eq:lola-reverse-sde}
+    \d{x_t} = \left[ f_t \, x_t - \frac{1 + \eta^2}{2} g_t^2 \, \grad{x_t} \log p(x_t) \right] \d{t} + \eta \, g_t \d{w_t}
+\end{equation}
+where $\eta \geq 0$ is a parameter controlling stochasticity, the coefficients $f_t$ and $g_t$ are derived from $\alpha_t$ and $\sigma_t$~\cite{anderson1982reversetime, sarkka2019applied, song2021scorebased}, and for which the variable $x_t$ follows $p(x_t)$. In other words, we can draw noise samples $x_1 \sim p(x_1) \approx \mathcal{N}(0, \sigma_1^2 I)$ and obtain data samples $x_0 \sim p(x_0) \approx p(x)$ by solving Eq. \eqref{eq:lola-reverse-sde} from $t = 1$ to $0$. For high-dimensional samples, the terminal signal-to-noise ratio $\nicefrac{\alpha_1}{\sigma_1}$ should be at or very close to zero \cite{lin2024common}. In this work, we adopt the rectified flow \cite{liu2023flow, lipman2023flow, esser2024scaling} noise schedule, for which $\alpha_t = 1 - t$ and $\sigma_t = t$.
+
+\paragraph{Denoising score matching}
+In practice, the score function $\grad{x_t} \log p(x_t)$ in Eq. \eqref{eq:lola-reverse-sde} is unknown, but can be approximated by a neural network trained via denoising score matching \cite{hyvarinen2005estimation, vincent2011connection}. Several equivalent parameterizations and objectives have been proposed for this task \cite{song2019generative, ho2020denoising, song2021denoising, song2021scorebased, karras2022elucidating, lipman2023flow}. In this work, we adopt the denoiser parameterization $d_\phi(x_t, t)$ and its objective \cite{karras2022elucidating}
+\begin{equation} \label{eq:lola-denoiser-objective}
+    \arg\min_\phi \mathbb{E}_{p(x) p(t) p(x_t \mid x)} \left[ \lambda_t \left\| d_\phi(x_t, t) - x \right\|_2^2 \right] \, ,
+\end{equation}
+for which the optimal denoiser is the mean $\mathbb{E}[x \mid x_t]$ of $p(x \mid x_t)$. Importantly, $\mathbb{E}[x \mid x_t]$ is linked to the score function through Tweedie's formula \cite{tweedie1947functions, efron2011tweedies, kim2021noise2score, meng2021estimating}
+\begin{equation} \label{eq:lola-optimal-denoiser}
+    \mathbb{E}[x \mid x_t] = \frac{x_t + \sigma_t^2 \grad{x_t} \log p(x_t)}{\alpha_t} \, ,
+\end{equation}
+which allows to use $s_\phi(x_t) = \sigma_t^{-2} (d_\phi(x_t, t) - \alpha_t \, x_t)$ as a score estimate in Eq. \eqref{eq:lola-reverse-sde}.
+
+\section{Methodology} \label{sec:lola-methodology}
+
+In this section, we detail and motivate our experimental methodology for investigating the impact of compression on the accuracy of latent-space emulators. To summarize, we consider three challenging datasets from TheWell \cite{ohana2024well}. For each dataset, we first train a series of autoencoders with varying compression rates. These autoencoders learn to map high-dimensional physical states $x^i \in \mathbb{R}^{H \times W \times C_\text{pixel}}$ to low-dimensional latent representations $z^i \in \mathbb{R}^{\frac{H}{r} \times \frac{W}{r} \times C_\text{latent}}$. Subsequently, for each autoencoder, we train two emulators operating in the latent space: a diffusion model (generative) and a neural solver (non-generative). Both are trained to predict the next $n$ latent states $z^{i+1:i+n}$ given the current latent state $z^i$ and simulation parameters $\theta$. This technique, known as temporal bundling \cite{brandstetter2022message}, mitigates the accumulation of errors during rollout by decreasing the number of required autoregressive steps. After training, latent-space emulators are used to produce autoregressive rollouts $z^{1:L}$ starting from known initial state $z^0 = E_\psi(x^0)$ and simulation parameters $\theta$, which are then decoded to the pixel space as $\hat{x}^i = D_\psi(z^i)$.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.95\textwidth]{./chapters/lola/figures/latent_emulation.pdf}
+    \caption{Illustration of the latent-space emulation process. At each step of the autoregressive rollout, the diffusion model generates the next $n = 4$ latent states $z^{i+1:i+n}$ given the current state $z^i$ and the simulation parameters $\theta$. After rollout, the generated latent states are decoded to pixel space.}
+    \label{fig:latent-emulation}
+\end{figure}
+
+\subsection{Datasets}
+
+To study the effects of extreme compression rates, the datasets we consider should be high-dimensional and contain large amounts of data. Intuitively, the effective size of the dataset decreases in latent space, making overfitting more likely at fixed model capacity. According to these criteria, we select three datasets from TheWell \cite{ohana2024well}. Additional details are provided in Appendix~\ref{app:details}.
+
+\paragraph{Euler Multi-Quadrants} The Euler equations model the behavior of compressible non-viscous fluids. In this dataset, the initial state presents multiple discontinuities which result in interacting shock waves as the system evolves for 100 steps. The 2d state of the system is represented with three scalar fields (energy, density, pressure) and one vector field (momentum) discretized on a $512 \times 512$ grid, for a total of $C_\text{pixel} = 5$ channels. Each simulation has either periodic or open boundary conditions and a different heat capacity $\gamma$, which constitutes their parameters $\theta$. We set a time stride $\Delta = 4$ between consecutive states $x^i$ and $x^{i+1}$, such that the simulation time $\tau = i \times \Delta$.
+
+\paragraph{Rayleigh-Bénard (RB)} The Rayleigh-Bénard convection phenomenon occurs when a horizontal layer of fluid is heated from below and cooled from above. Over the 200 simulation steps, the temperature difference leads to the formation of convection currents where cooler fluid sinks and warmer fluid rises. The 2d state of the system is represented with two scalar fields (buoyancy, pressure) and one vector field (velocity) discretized on a $512 \times 128$ grid, for a total of $C_\text{pixel} = 4$ channels. Each simulation has different Rayleigh and Prandtl numbers as parameters $\theta$. We set a time stride $\Delta = 1$.
+
+\paragraph{Turbulence Gravity Cooling (TGC)} The interstellar medium can be modeled as a turbulent fluid subject to gravity and radiative cooling. Starting from a homogeneous state, dense filaments form in the fluid, leading to the birth of stars. The 3d state of the system is represented with three scalar fields (density, pressure, temperature) and one vector field (velocity) discretized on a $64 \times 64 \times 64$ grid, for a total of $C_\text{pixel} = 6$ channels. Each simulation has different initial conditions function of their density, temperature, and metallicity. We set a time stride $\Delta = 1$.
+
+\subsection{Autoencoders}
+
+To isolate the effect of compression, we use a consistent autoencoder architecture and training setup across datasets and compression rates. We focus on compressing individual states $x^i$ into latent states $z^i = E_\psi(x^i)$, which are reconstructed as $\hat{x}^i = D_\psi(z^i)$.
+
+\paragraph{Architecture} We adopt a convolution-based autoencoder architecture similar to the one used by \textcite{rombach2022highresolution}, which we adapt to perform well under high compression rates. Specifically, inspired by \textcite{chen2025deep}, we initialize the downsampling and upsampling layers near identity, which enables training deeper architectures with complex latent representations, while preserving reconstruction quality. For 2d datasets (Euler and RB), we set the spatial downsampling factor $r = 32$ for all autoencoders, meaning that a $32 \times 32$ patch in pixel space corresponds to one token in latent space. For 3d datasets (TGC), we set $r = 8$. The compression rate is then controlled solely by varying the number of channels per token in the latent representation. For instance, with the Euler dataset, an autoencoder with $C_\text{latent} = 64$ latent channels -- \texttt{f32c64} in the notations of \textcite{chen2025deep} -- transforms the input state with shape $512 \times 512 \times 5$ to a latent state with shape $16 \times 16 \times 64$, yielding a compression rate of $80$. This setup ensures that the architectural capacity remains similar for all autoencoders and allows for fair comparison across compression rates. Further details as well as a short ablation study are provided in Appendix \ref{app:details}.
+
+\paragraph{Training} Latent diffusion models \cite{rombach2022highresolution} often rely on a Kullback-Leibler (KL) divergence penalty to encourage latents to follow a standard Gaussian distribution. However, this term is typically down-weighted by several orders of magnitude to prevent severe reconstruction degradation. As such, the KL penalty acts more as a weak regularization than a proper variational objective \cite{dieleman2025generative} and post-hoc standardization of latents is often necessary. We replace this KL penalty with a deterministic saturating function
+\begin{equation}
+    z \mapsto \frac{z}{\sqrt{1 + \nicefrac{z^2}{B^2}}}
+\end{equation}
+applied to the encoder's output. In our experiments, we choose the bound $B = 5$ to mimic the range of a standard Gaussian distribution. We find this approach simpler and more effective at structuring the latent space, without introducing a tradeoff between regularization and reconstruction quality. We additionally omit perceptual \cite{zhang2018unreasonable} and adversarial \cite{goodfellow2014generative, esser2021taming} loss terms, as they are designed for natural images where human perception is the primary target, unlike physics. The training objective thus simplifies to a reconstruction loss
+\begin{equation}
+    \arg\min_\psi \mathbb{E}_{p(x)} \left[ \ell(x, D_\psi(E_\psi(x))) \right] \, .
+\end{equation}
+The loss $\ell$ is typically a variation of $L_1$ or $L_2$ regression, which we discuss in Appendix \ref{app:details}. Finally, we find that preconditioned optimizers \cite{li2018preconditioned, gupta2018shampoo, vyas2025soap} greatly accelerate the training convergence of autoencoders compared to the widespread Adam \cite{kingma2015adam} optimizer (see Table \ref{tab:rb-ae-ablation}). We adopt the PSGD~\cite{li2018preconditioned} implementation in the \texttt{heavyball} \cite{nestler2022heavyball} library for its fewer number of tunable hyper-parameters and lower memory footprint than SOAP \cite{vyas2025soap}.
+
+\subsection{Diffusion models}
+
+\begin{figure}[b]
+    \centering
+    \includegraphics[width=0.5\textwidth]{./chapters/lola/figures/latent_denoiser.pdf}
+    \caption{Illustration of the denoiser's inputs and outputs, while generating from $p(z^{i+1:i+n} \mid z^i, \theta)$. A binary mask $b$ is concatenated to the input to indicate which elements are noisy. The transformer blocks are modulated with respect to the parameters $\theta$ and the diffusion time $t$.}
+    \label{fig:denoiser-io}
+\end{figure}
+
+We train diffusion models to predict the next $n$ latent states $z^{i+1:i+n}$ given the current state $z^i$ and simulation parameters $\theta$, that is to generate from $p(z^{i+1:i+n} \mid z^i, \theta)$. We parameterize our diffusion models with a denoiser $d_\phi(z_t^{i:i+n}, b, \theta, t)$ whose task is to denoise sequences of noisy states $z_t^{i} \sim p(z_t^{i} \mid z^{i}) = \mathcal{N}(z_t^{i} \mid \alpha_t \, z^{i}, \sigma_t^2 I)$ given the parameters $\theta$ of the simulation. Conditioning with respect to known elements in the sequence $z^{i:i+n}$ is tackled with a binary mask $b \in \{0, 1\}^{n+1}$ concatenated to the input, as in MCVD \cite{voleti2022mcvd}. For instance, $b = (1, 0, \dots, 0)$ indicates that the first element $z^i$ is known, while $b = (1, \dots, 1, 0)$ indicates that the first $n - 1$ elements $z^{i:i+n-1}$ are known. Known elements are provided to the denoiser without noise.
+
+\paragraph{Architecture} Drawing inspiration from recent successes in latent image generation \cite{peebles2023scalable, karras2024analyzing, esser2024scaling, xie2025sana, chen2025deep}, we use a transformer-based architecture for the denoiser. We incorporate several architectural refinements shown to improve performance and stability, including query-key normalization \cite{henry2020querykey}, rotary positional embedding (RoPE) \cite{su2024roformer, heo2025rotary}, and value residual learning \cite{zhou2024value}. The transformer operates on the spatial and temporal axes of the input $z_t^{i:i+n}$, while the parameters $\theta$ and diffusion time $t$ modulate the transformer blocks. Thanks to the considerable ($r = 32$) spatial downsampling performed by the autoencoder, we are able to apply full spatio-temporal attention, avoiding the need for sparse attention patterns \cite{huang2019ccnet, ho2019axial, hassani2023neighborhood}. Finally, we fix the token embedding size (1024) and the number of transformer blocks (16) for all diffusion models. The only architectural variation stems from the number of input and output channels dictated by the corresponding autoencoder.
+
+\paragraph{Training} As in Section \ref{sec:lola-diffusion}, diffusion models are trained via denoising score matching \cite{vincent2011connection, hyvarinen2005estimation}
+\begin{equation}
+    \arg\min_\phi \mathbb{E}_{p(\theta, z^{i:i+n}, z_t^{i:i+n}) p(b)} \Big[ \big\| d_\phi(\underbrace{z^{i:i+n} \odot b}_\text{clean} + \underbrace{z_t^{i:i+n} \odot (1 - b)}_\text{noisy}, b, \theta, t) - z^{i:i+n} \big\|_2^2 \Big]
+\end{equation}
+with the exception that the data does not come from the pixel-space distribution $p(\theta, x^{1:L})$ but from the latent-space distribution $p(\theta, z^{1:L})$ determined by the encoder $E_\psi$. Following \textcite{voleti2022mcvd}, we randomly sample the binary mask $b \sim p(b)$ during training to cover several conditioning tasks, including prediction with variable-length context $p(z^{i+c:i+n} \mid z^{i:i+c-1})$.
+
+\paragraph{Sampling} After training, we sample from the learned distribution by solving Eq.~\eqref{eq:lola-reverse-sde} with $\eta = 0$, which corresponds to the probability flow ODE \cite{song2021scorebased}. To this end, we implement a 3rd order Adams-Bashforth multi-step integration method, as proposed by \textcite{zhang2023fast}. Intuitively, this method leverages information from previous integration steps to improve accuracy. We find this approach highly effective, producing high-quality samples with significantly fewer neural function evaluations (NFEs) than other widespread samplers~\cite{song2021denoising, karras2022elucidating}.
+
+\subsection{Neural solvers}
+
+We train neural solvers to perform the same task as diffusion models. Unlike the latter, however, solvers do not generate from $p(z^{i+1:i+n} \mid z^i, \theta)$, but produce a point estimate $f_\phi(z_i, \theta) \approx \mathbb{E}\big[ z^{i+1:i+n} \mid z_i, \theta \big]$ instead. We also train a pixel-space neural solver, for which $z^i = x^i$, as baseline.
+
+\paragraph{Architecture} For latent-space neural solvers, we use the same transformer-based architecture as for diffusion models. The only notable difference is that transformer blocks are only modulated with respect to the simulation parameters $\theta$. For the pixel-space neural solver, we keep the same architecture, but group the pixels into $16 \times 16$ patches, as in vision transformers \cite{dosovitskiy2021image}. We also double the token embedding size (2048) such that the pixel-space neural solver has roughly two times more trainable parameters than an autoencoder and latent-space emulator combined.
+
+\paragraph{Training} Neural solvers are trained via mean regression
+\begin{equation}
+    \arg\min_\phi \mathbb{E}_{p(\theta, z^{i:i+n}) p(b)} \left[ \big\| f_\phi(z^{i:i+n} \odot b, b, \theta) - z^{i:i+n} \big\|_2^2 \right] \, .
+\end{equation}
+Apart from the training objective, the training configuration (optimizer, learning rate schedule, batch size, epochs, masking, ...) for neural solvers is strictly the same as for diffusion models.
+
+\subsection{Evaluation metrics}
+
+We consider several metrics for evaluation, each serving a different purpose. We report these metrics either at a lead time $\tau = i \times \Delta$ or averaged over a lead time horizon $a\!:\!b$. If the states $x^i$ present several fields, the metric is first computed on each field separately, then averaged.
+
+\paragraph{Variance-normalized RMSE} The root mean squared error (RMSE) and its normalized variants are widespread metrics to quantify the point-wise accuracy of an emulation \cite{fortin2014why, mccabe2023stability, ohana2024well}. Following \textcite{ohana2024well}, we pick the variance-normalized RMSE (VRMSE) over the more common normalized RMSE (NRMSE), as the latter down-weights errors in non-negative fields such as pressure and density. Formally, for two spatial fields $u$ and $v$, the VRMSE is defined as
+\begin{equation} \label{eq:lola-vrmse}
+    \operatorname{VRMSE}(u, v) = \sqrt{\frac{\left\langle (u - v)^2 \right\rangle}{\left\langle (u - \langle u \rangle)^2 \right\rangle + \epsilon}}
+\end{equation}
+where $\langle \cdot \rangle$ denotes the spatial mean operator and $\epsilon = \num{e-6}$ is a numerical stability term.
+
+\paragraph{Power spectrum RMSE} For chaotic systems such as turbulent fluids, it is typically intractable to achieve accurate long-term emulation as very small errors can lead to entirely different trajectories later on. In this case, instead of reproducing the exact trajectory, emulators should generate diverse trajectories that remain statistically plausible. Intuitively, even though structures are wrongly located, the types of patterns and their distribution should stay similar \cite{dryden1943review}. Following \textcite{ohana2024well}, we assess statistical plausibility by comparing the power spectra of the ground-truth and emulated trajectories. For two spatial fields $u$ and $v$, we compute the isotropic power spectra $p_u$ and $p_v$ and split them into three frequency bands (low, mid and high) evenly distributed in log-space. We report the RMSE of the relative power spectra $\nicefrac{p_v}{p_u}$ over each band.
+
+\paragraph{Spread-skill ratio} In earth sciences \cite{fortin2014why, price2025probabilistic}, the skill of an ensemble of $K$ particles is defined as the RMSE of the ensemble mean. The spread is defined as the ensemble standard deviation. Under these definitions and the assumption of a perfect forecast where ensemble particles are exchangeable, \textcite{fortin2014why} show that
+\begin{equation}
+    \operatorname{Skill} \approx \sqrt{\nicefrac{K+1}{K}} \, \operatorname{Spread} \, .
+\end{equation}
+This motivates the use of the (corrected) spread-skill ratio as a metric. Intuitively, if the ratio is smaller than one, the ensemble is biased or under-dispersed. If the ratio is larger than one, the ensemble is over-dispersed. It should be noted, however, that a spread-skill ratio of 1 is a necessary but insufficient condition for a perfect forecast.
+
+\section{Results} \label{sec:lola-results}
+
+We start with the evaluation of the autoencoders. For all datasets, we train three autoencoders with respectively 64, 16, and 4 latent channels. These correspond to compression rates of 80, 320 and 1280 for the Euler dataset, 64, 256, and 1024 for the RB dataset, and 48, 192, 768 for the TGC dataset, respectively. In the following, we refer to models by their compression rate. Additional experimental details are provided in Section \ref{sec:lola-methodology} and Appendix \ref{app:details}.
+
+For each autoencoder, we evaluate the reconstruction $\hat{x}^i = D_\psi(E_\psi(x^i))$ of all states $x^i$ in 64 test trajectories $x^{0:L}$. As expected, when the compression rate increases, the reconstruction quality degrades, as reported in Figure \ref{fig:ae-vrmse}. For the Euler dataset, the reconstruction error grows with the lead time due to wavefront interactions and rising high-frequency content. For the RB dataset, the reconstruction error peaks mid-simulation during the transition from low to high-turbulence regime. Similar trends can be observed for the power spectrum RMSE in Tables \ref{tab:euler-power-rmse}, \ref{tab:rb-power-rmse} and \ref{tab:tgc-power-rmse}, where the high-frequency band is most affected by compression. These results so far align with what practitioners intuitively expect from lossy compression.
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.32\textwidth]{./chapters/lola/figures/euler_ae_mean_absolute.pdf}
+    \includegraphics[width=0.32\textwidth]{./chapters/lola/figures/rb_ae_mean_absolute.pdf}
+    \includegraphics[width=0.32\textwidth]{./chapters/lola/figures/tgc_ae_mean_absolute.pdf}
+    \caption{Average VRMSE of the autoencoder reconstruction at different compression rates and lead time horizons for the Euler (left), RB (center) and TGC (right) datasets. The compression rate has a clear impact on reconstruction quality.}
+    \label{fig:ae-vrmse}
+\end{figure}
+
+We now turn to the evaluation of the emulators. For each autoencoder, we train two latent-space emulators: a diffusion model and a neural solver. Starting from the initial state $z^0 = E_\psi(x^0)$ and simulation parameters $\theta$ of 64 test trajectories $x^{0:L}$, each emulator produces 16 distinct autoregressive rollouts $z^{1:L}$, which are then decoded to the pixel space as $\hat{x}^i = D_\psi(z^i)$. Note that for neural solvers, all 16 rollouts are identical. We compute the metrics of each prediction $\hat{x}^i$ against the ground-truth state $x^i$.
+
+As expected from imperfect emulators, the emulation error grows with the lead time, as shown in Figures \ref{fig:euler-mosaic} and \ref{fig:all-mosaic}. However, the point-wise error of diffusion models, as measured by the VRMSE, does not grow (Euler, TGC) and sometimes decreases (RB) with higher compression rates. Even at extreme ($>1000$) compression rates, latent-space emulators outperform the baseline pixel-space neural solver, despite the latter benefiting from more parameters and training compute. Similar observations can be made with the power spectrum RMSE over low and mid-frequency bands. High-frequency content, however, appears limited by the autoencoder's reconstruction capabilities. We confirm this hypothesis by recomputing the metrics relative to the autoencoded state $D_\psi(E_\psi(x^i))$, which we report in Figure~\ref{fig:all-mosaic-relative}. This time, the power spectrum RMSE of the diffusion models is low for mid and high-frequency bands. These findings support a puzzling narrative: emulation accuracy exhibits strong resilience to latent-space compression, starkly contrasting with the clear degradation in reconstruction quality.
+
+\begin{figure}[!b]
+    \vspace{-0.5em}
+    \centering
+    \includegraphics[width=\textwidth]{./chapters/lola/compressed/examples/example_1.pdf}
+    \caption{Examples of latent-space emulation for the Euler (left) and Rayleigh-Bénard (right) datasets. Even for large compression rates ($\div$), latent-space emulators are able to reproduce the dynamics surprisingly faithfully, despite significant reconstruction artifacts. For Euler, wavefronts are accurately propagated until the end of the simulation, while vortices are well located, but distorted. For Rayleigh-Bénard, diffusion-based emulators produce plumes that grow at the correct pace but diverge from the ground-truth. Similar observations can be made in Figures \ref{fig:viz-euler-1} to \ref{fig:viz-tgc-4}.}
+    \label{fig:viz-0}
+\end{figure}
+
+\begin{figure}[!b]
+    \vspace{-0.5em}
+    \centering
+    \includegraphics[width=\textwidth]{./chapters/lola/figures/euler_mosaic_mean_absolute.pdf}
+    \caption{Average evaluation metrics of latent-space emulation for the Euler dataset. As expected from imperfect emulators, the emulation error grows with the lead time. However, the compression rate has little to no impact on diffusion-based emulation accuracy, beside high-frequency content. The spread-skill ratio \cite{fortin2014why, price2025probabilistic} drops slightly with the compression rate, which could be a sign of overfitting. Diffusion-based emulators are consistently more accurate than neural solvers.}
+    \label{fig:euler-mosaic}
+    \vspace{-0.5em}
+\end{figure}
+
+\begin{wraptable}{r}{0.4\textwidth}
+    \centering
+    \caption{Inference time per state for the Euler dataset, including generation and decoding.}
+    \small
+    \begin{tabular}{ccc}
+        \toprule
+        Method & Space & Time \\
+        \midrule
+        simulator & pixel & $\mathcal{O}(\qty{10}{\second})$ \\
+        neural solver & pixel & \qty{56}{\milli\second} \\
+        neural solver & latent & \qty{13}{\milli\second} \\
+        diffusion & pixel & $\mathcal{O}(\qty{1}{\second})$ \\
+        diffusion & latent & \qty{84}{\milli\second} \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:inference-time}
+\end{wraptable}
+
+Our experiments also provide a direct comparison between generative (diffusion) and deterministic (neural solver) approaches to emulation within a latent space. Figures \ref{fig:all-mosaic} and \ref{fig:all-mosaic-relative} indicate that diffusion-based emulators are consistently more accurate than their deterministic counterparts and generate trajectories that are statistically more plausible in terms of power spectrum. This can be observed qualitatively in Figure \ref{fig:viz-0} or Figures \ref{fig:viz-euler-1} to \ref{fig:viz-tgc-4} in Appendix \ref{app:emulation-results}. In addition, the spread-skill ratio of diffusion models is close to 1, suggesting that the ensemble of trajectories they produce are reasonably well calibrated in terms of uncertainty. However, the ratio slightly decreases with the compression rate. This phenomenon is partially explained by the smoothing effect of $L_2$-driven compression, and is therefore less severe in Figure \ref{fig:all-mosaic-relative}. Nonetheless, it remains present and could be a sign of overfitting due to the reduced amount of training data in latent space.
+
+In terms of computational cost, although they remain slower than latent-space neural solvers, latent-space diffusion models are much faster than their pixel-space counterparts and competitive with pixel-space neural solvers (see Table \ref{tab:inference-time}). With our latent diffusion models, generating and decoding a full (100 simulation steps, 7 autoregressive steps) Euler trajectory takes 3 seconds on a single A100 GPU, compared to roughly 1 CPU-hour with the original numerical simulation \cite{mandli2016clawpack, ohana2024well}.
+
+\begin{figure}[!b]
+    \centering
+    \includegraphics[width=\textwidth]{./chapters/lola/compressed/examples/example_2.pdf}
+    \caption{Example of guided latent-space emulation for the RB (left) and TGC (right) datasets. The observations are the states downsampled by a factor 16 for RB and a stripe along the domain boundaries for TGC. Guidance is performed using the MMPS \cite{rozet2024learning} method. Thanks to the additional information in the observations, the emulation diverges less from the ground-truth.}
+    \label{fig:rb-guidance}
+\end{figure}
+
+A final advantage of diffusion models lies in their capacity to incorporate additional information during sampling via guidance methods \cite{song2021scorebased, ho2022video, chung2023diffusion, rozet2023scorebased, rozet2024learning}. For example, if partial or noisy state observations are available, we can guide the emulation such that it remains consistent with these observations. We provide an illustrative example in Figure \ref{fig:rb-guidance} where guidance is performed with the MMPS \cite{rozet2024learning} method. Thanks to the additional information in the observations, the emulation diverges less from the ground-truth.
+
+\section{Related work} \label{sec:lola-related-work}
+
+Data-driven emulation of dynamical systems has become a prominent research area \cite{tompson2017accelerating, sanchez-gonzalez2020learning, pfaff2021learning, brandstetter2022message, stachenfeld2022learned, kovachki2023neural, lam2023learning, mccabe2024multiple, herde2024poseidon, morel2025disco} with diverse applications, including accelerating fluid simulations on uniform meshes using convolutional networks \cite{tompson2017accelerating, stachenfeld2022learned}, emulating various physics on non-uniform meshes with graph neural networks~\cite{sanchez-gonzalez2020learning, pfaff2021learning, brandstetter2022message, lam2023learning}, and solving partial differential equations with neural operators \cite{li2021fourier, raonic2023convolutional, hao2023gnot, mccabe2023stability, kovachki2023neural}. However, \textcite{mccabe2024multiple} and \textcite{herde2024poseidon} highlight the large data requirements of these methods and propose pre-training on multiple data-abundant physics before fine-tuning on data-scarce ones to improve data efficiency and generalization. Our experiments similarly suggest that large datasets are needed to train latent-space emulators.
+
+A parallel line of work, related to reduced-order modeling \cite{benner2015survey}, focuses on learning low-dimensional representations of high-dimensional system states. Within this latent space, dynamics can be emulated more efficiently \cite{lusch2018deep, lui2019construction, wiewel2019latent, maulik2021reducedorder, han2022predicting, geneva2022transformers, chen2023crom, hemmasian2023reducedorder, li2025latent}. Various embedding approaches have been explored: convolutional autoencoders for uniform meshes \cite{wiewel2019latent, maulik2021reducedorder}, graph-based autoencoders for non-uniform meshes \cite{han2022predicting}, and implicit neural representations for discretization-free states \cite{chen2023crom, du2024conditional}. Koopman operator theory~\cite{koopman1931hamiltonian} has also been integrated into autoencoder training to promote linear latent dynamics \cite{yeung2019learning, geneva2022transformers}. Other approaches to enhance latent predictability include regularizing temporal derivatives~\cite{xie2024smooth}, jointly optimizing the decoder and latent emulator \cite{regazzoni2024learning}, and self-supervised prediction \cite{bardes2024revisiting}. While our work adopts this latent emulation paradigm, we do not impose structural biases on the latent space beside reconstruction quality.
+
+A persistent challenge in neural emulation is ensuring temporal stability. Many models, while accurate for short-term prediction, exhibit long-term instabilities as errors accumulate, pushing the predictions out of the training data distribution \cite{mccabe2023stability}. Several strategies have been proposed to mitigate this issue: autoregressive unrolling during training \cite{lusch2018deep, geneva2020modeling, brandstetter2022message}, architectural modifications \cite{mccabe2023stability, raonic2023convolutional}, noise injection \cite{stachenfeld2022learned}, and post-processing \cite{lippe2023pderefiner, worrall2024spectral}. Generative models, particularly diffusion models, have recently emerged as a promising approach to address this problem \cite{lippe2023pderefiner, cachay2023dyffusion, kohl2024benchmarking, shysheya2024conditional, huang2024diffusionpde, price2025probabilistic} as they produce statistically plausible states, even when they diverge from the ground-truth solution.
+
+While more accurate and stable, diffusion models are computationally expensive at inference. Drawing inspiration from latent space generation in computer vision \cite{rombach2022highresolution, peebles2023scalable, esser2024scaling, karras2024analyzing, xie2025sana, chen2025deep, polyak2024movie}, recent studies have applied latent diffusion models to emulate dynamical systems: \textcite{gao2023prediff} address short-term precipitation forecasting, \textcite{zhou2025text2pde} generate trajectories conditioned on text descriptions, \textcite{du2024conditional} generate trajectories within an implicit neural representation, and \textcite{li2025generative} combine a state-wise autoencoder with a spatio-temporal diffusion transformer \cite{peebles2023scalable} for autoregressive emulation, similar to our approach. These studies report favorable or competitive results against pixel-space and deterministic baselines, consistent with our observations.
+
+\section{Discussion} \label{sec:lola-discussion}
+
+Our results reveal key insights about latent physics emulation. First, diffusion-based emulation accuracy is surprisingly robust to latent-space compression, with performance remaining constant or even improving when autoencoder reconstruction quality significantly deteriorates. This observation is consistent with the latent generative modeling literature \cite{rombach2022highresolution, dieleman2025generative}, where compression serves a dual purpose: reducing dimensionality and filtering out perceptually irrelevant patterns that might distract from semantically meaningful information. Our experiments support this hypothesis as latent-space emulators outperform their pixel-space counterparts despite using fewer parameters and requiring less training compute. \textcite{yao2025reconstruction} similarly demonstrate that higher compression can sometimes improve generation quality despite degrading reconstruction. While our findings seem to violate the famous data processing inequality,\sidenote{\textit{The weakness of the Kolmogorov complexity theory is that it focuses on Shannon information and ignores computability.}\\[1ex] --- Ilya Sutskever (2023) \nocite{sutskever2023observation}} they are well aligned with the theory of \emph{usable} information \cite{xu2020theory}, where a learned representation can hold more $\mathcal{V}$-information from the point of view of a computationally constrained observer. Second, diffusion-based generative emulators consistently achieve higher ensemble accuracy than deterministic neural solvers while producing diverse, statistically plausible trajectories. This supports the idea that generative models mitigate distribution shift \cite{lippe2023pderefiner, cachay2023dyffusion, kohl2024benchmarking, shysheya2024conditional, huang2024diffusionpde, price2025probabilistic}. However, at the first prediction step, before distribution shift can take effect, diffusion models are already more accurate than deterministic neural solvers. This suggests an inherent modeling advantage, possibly lying in the iterative nature of diffusion sampling.
+
+Despite the finite number of datasets, we believe that our findings are likely to generalize well across the broader spectrum of fluid dynamics. The Euler, RB and TGC datasets represent distinct fluid regimes that cover many key challenges in dynamical systems emulation: nonlinearities, multi-scale interactions, and complex spatio-temporal patterns. In addition, previous studies \cite{gao2023prediff, zhou2025text2pde, du2024conditional, li2025generative} come to similar conclusions for other fluid dynamics problems. However, we exercise caution about extending these conclusions beyond fluids. Systems governed by fundamentally different physics, such as chemical or quantum phenomena, may respond unpredictably to latent compression. Probing these boundaries represents an important direction for future research. Our empirical findings also prompt the need for theoretical explanations, which we leave to future work.
+
+Apart from datasets, if compute resources were not a limiting factor, our study could be extended along several dimensions, although we anticipate that additional experiments would not fundamentally alter our conclusions. First, we could investigate techniques for improving the structure of the latent representation, such as incorporating Koopman-inspired losses \cite{yeung2019learning, geneva2022transformers}, regularizing temporal derivatives \cite{xie2024smooth}, or training shallow auxiliary decoders \cite{yao2025reconstruction, chen2025masked}. Second, we could probe the behavior of different embedding strategies under high compression, including spatio-temporal embeddings \cite{yu2023magvit, zhou2025text2pde, du2024conditional}, implicit neural representations \cite{chen2023crom, du2024conditional}, and masked autoencoders \cite{he2022masked, chen2025masked}. Third, we could add the capability to trade speed for accuracy, analogous to running numerical solvers at finer resolutions, by training an autoencoder with an adaptive latent dimensionality \cite{karkadaashok2018autoencoders, pham2022pcaae, bachmann2025flextok}. Fourth, we could study the effects of autoencoder and emulator capacity by scaling either up or down their number of trainable parameters. Each of these directions represents a substantial computational investment, particularly given the scale of our datasets and models, but would help establish best practices for latent-space emulation.
+
+Nevertheless, our findings lead to clear recommendations for practitioners wishing to implement physics emulators. First, try latent-space approaches before pixel-space emulation. The former offer reduced computational requirements, lower memory footprint, and comparable or better accuracy across a wide range of compression rates. Second, prefer diffusion-based emulators over deterministic neural solvers. Latent diffusion models provide more accurate, diverse and stable long-term trajectories, while narrowing the inference speed gap significantly.
+
+Our experiments, however, reveal important considerations about dataset scale when training latent-space emulators. The decreasing spread-skill ratio observed at higher compression rates suggests potential overfitting. This makes intuitive sense: as compression increases, the effective size of the dataset in latent space decreases, making overfitting more likely at fixed model capacity. Benchmarking latent emulators on smaller (10-100 GB) datasets like those used by \textcite{kohl2024benchmarking} could therefore yield misleading results. In addition, because the latent space is designed to preserve pixel space content, observing overfitting in this compressed representation suggests that pixel-space models encounter similar issues that remain undetected. This points towards the need for large training datasets or mixtures of datasets used to pre-train emulators before fine-tuning on targeted physics, as advocated by \textcite{mccabe2024multiple} and \textcite{herde2024poseidon}.
+
+\section*{Acknowledgments}
+
+We thank Géraud Krawezik and the Scientific Computing Core at the Flatiron Institute, a division of the Simons Foundation, for the compute facilities and support. We gratefully acknowledge use of the research computing resources of the Empire AI Consortium, Inc., with support from the State of New York, the Simons Foundation, and the Secunda Family Foundation. Polymathic AI acknowledges funding from the Simons Foundation and Schmidt Sciences, LLC. François Rozet is a research fellow of the F.R.S.-FNRS (Belgium) and acknowledges its financial support.
+
+\clearpage
+\section*{References}
+
+\printbibliography[heading=none]
+
+\begin{subappendices}
+
+\clearpage
+\section{Spread / Skill}
+
+The skill \cite{fortin2014why, price2025probabilistic} of an ensemble of $K$ particles $v_k$ is defined as the RMSE of the ensemble mean
+\begin{equation}
+    \operatorname{Skill} = \sqrt{\left\langle \left( u - \frac{1}{K} \sum_{k=1}^K v_k \right)^2 \right\rangle}
+\end{equation}
+where $\langle \cdot \rangle$ denotes the spatial mean operator. The spread is defined as the ensemble standard deviation
+\begin{equation}
+    \operatorname{Spread} = \sqrt{\left\langle \frac{1}{K - 1} \sum_{j=1}^K  \left( v_j - \frac{1}{K} \sum_{k=1}^K v_k \right)^2 \right\rangle} \, .
+\end{equation}
+Under these definitions and the assumption of a perfect forecast where ensemble particles are exchangeable, \textcite{fortin2014why} show that
+\begin{equation}
+    \operatorname{Skill} \approx \sqrt{\frac{K+1}{K}} \, \operatorname{Spread} \, .
+\end{equation}
+This motivates the use of the (corrected) spread-skill ratio as a metric. Intuitively, if the ratio is smaller than one, the ensemble is biased or under-dispersed. If the ratio is larger than one, the ensemble is over-dispersed. It should be noted however, that a spread-skill ratio of 1 is a necessary but not sufficient condition for a perfect forecast.
+
+\clearpage
+\section{Experiment details} \label{app:details}
+
+\paragraph{Datasets} For all datasets, each field is standardized with respect to its mean and variance over the training set. For Euler, the non-negative scalar fields (energy, density, pressure) are transformed with $x \mapsto \log (x + 1)$ before standardization. For TGC, the non-negative scalar fields (density, pressure, temperature) are transformed with $x \mapsto \log (x + \num{e-6})$ before standardization. When the states are illustrated graphically, as in Figure~\ref{fig:latent-emulation}, we represent the density field for Euler, the buoyancy field for RB, and a slice of the temperature field for TGC.
+
+\begin{table}[!h]
+    \centering
+    \caption{Details of the selected datasets. We refer the reader to \textcite{ohana2024well} for more information.}
+    \footnotesize
+    \begin{tabular}{lccc}
+        \toprule
+        & Euler Multi-Quadrants & Rayleigh-Bénard & Turbulence Gravity Cooling \\
+        \midrule
+        Software & Clawpack \cite{mandli2016clawpack} & Dedalus \cite{burns2020dedalus} & ASURA-FDPS \cite{hirashima20233dspatiotemporal} \\
+        Size & \qty{5243}{\giga\byte} & \qty{367}{\giga\byte} & \qty{849}{\giga\byte} \\
+        \multirow{2}{*}{Fields} & energy, density, & buoyancy, pressure, & density, pressure, \\
+        & pressure, velocity & momentum & temperature, velocity \\[0.25em]
+        Channels $C_\text{pixel}$ & 5 & 4 & 6 \\
+        Resolution & $512 \times 512$ & $512 \times 128$ & $64 \times 64 \times 64$ \\
+        Discretization & Uniform & Chebyshev & Uniform \\
+        Trajectories & 10000 & 1750 & 2700 \\
+        Time steps $L$ & 100 & 200 & 50 \\
+        Stride $\Delta$ & 4 & 1 & 1 \\
+        \multirow{2}{*}{$\theta$} & heat capacity $\gamma$, & Rayleigh number, & hydrogen density $\rho_0$, \\
+        & boundary conditions & Prandtl number & temperature $T_0$, metallicity $Z$ \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:datasets-details}
+\end{table}
+
+\paragraph{Autoencoders} The encoder $E_\psi$ and decoder $D_\psi$ are convolutional networks with residual blocks \cite{he2016deep}, SiLU \cite{elfwing2018sigmoidweighted} activation functions and layer normalization \cite{ba2016layer}. The output of the encoder is transformed with a saturating function (see Section \ref{sec:lola-methodology}). We provide a schematic illustration of the autoencoder architecture in Figure \ref{fig:ae-diagram}. Following \textcite{mccabe2024multiple}, we use a field-weighted loss $\ell$, and choose the variance-normalized MSE (VMSE)
+\begin{equation} \label{eq:lola-vmse}
+    \operatorname{VMSE}(u, v) = \frac{\big\langle (u - v)^2 \big\rangle}{\big\langle (u - \langle u \rangle)^2 \big\rangle + \epsilon}
+\end{equation}
+averaged over fields, where $\epsilon = \num{e-2}$ mitigates training instabilities. We train the encoder and decoder jointly for $1024 \times 256$ steps of the PSGD \cite{li2018preconditioned} optimizer. To mitigate overfitting we use random spatial axes permutations, flips and rolls as data augmentation. Each autoencoder takes 1 (RB), 2 (Euler) or 4 (TGC) days to train on 8 H100 GPUs. Other hyperparameters are provided in Table \ref{tab:ae-details}.
+
+\begin{table}[!h]
+    \centering
+    \caption{Hyperparameters for the autoencoders.}
+    \footnotesize
+    \begin{tabular}{lcc}
+        \toprule
+        & Euler \& RB & TGC \\
+        \midrule
+        Architecture & Conv & Conv \\
+        Parameters & \num{3.1e8} & \num{7.2e8} \\
+        Pixel shape & $C_\text{pixel} \times H \times W$ & $C_\text{pixel} \times H \times W \times Z$ \\
+        Latent shape & $C_\text{latent} \times \frac{H}{32} \times \frac{W}{32}$ & $C_\text{latent} \times \frac{H}{8} \times \frac{W}{8} \times \frac{Z}{8}$ \\[0.25em]
+        Residual blocks per level & (3, 3, 3, 3, 3, 3) & (3, 3, 3, 3) \\
+        Channels per level & (64, 128, 256, 512, 768, 1024) & (64, 256, 512, 1024) \\
+        Kernel size & $3 \times 3$ & $3 \times 3 \times 3$ \\
+        Activation & SiLU & SiLU \\
+        Normalization & LayerNorm & LayerNorm \\
+        Dropout & 0.05 & 0.05 \\
+        \midrule
+        Loss & VMSE & VMSE \\
+        Optimizer & PSGD & PSGD \\
+        Learning rate & \num{e-5} & \num{e-5} \\
+        Weight decay & 0.0 & 0.0 \\
+        Scheduler & cosine & cosine \\
+        Gradient norm clipping & 1.0 & 1.0 \\
+        Batch size & 64 & 64 \\
+        Steps per epoch & 256 & 256 \\
+        Epochs & 1024 & 1024 \\
+        GPUs & 8 & 8 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:ae-details}
+\end{table}
+
+\begin{table}[!h]
+    \centering
+    \caption{Short ablation study on the autoencoder architecture and training configurations. We pick the Rayleigh-Bénard dataset and an architecture with 64 latent channels to perform this study. The two major modifications that we propose are (1) the initialization of the downsampling and upsampling layers near identity, inspired by \textcite{chen2025deep}, and (2) the use of a preconditioned optimizer, PSGD~\cite{li2018preconditioned}, instead of Adam \cite{kingma2015adam}. We report the mean absolute error (MAE) on the validation set during training. The combination of both proposed modifications leads to order(s) of magnitude faster convergence.}
+    \small
+    \begin{tabular}{clcccc}
+        \toprule
+        \multirow[c]{2}{*}{Optimizer} & \multirow[c]{2}{*}{Id. init} & \multicolumn{3}{c}{Epoch} & \multirow[c]{2}{*}{Time} \\
+        \cmidrule(lr){3-5}
+        & & 10 & 100 & 1000 \\
+        \midrule
+        Adam & w/o & 0.065 & 0.029 & 0.017 & \qty{19}{\hour} \\
+        Adam & w/ & 0.039 & 0.023 & 0.014 & \qty{19}{\hour} \\
+        PSGD & w/ & 0.023 & 0.015 & 0.011 & \qty{25}{\hour} \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:rb-ae-ablation}
+\end{table}
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=\textwidth]{./chapters/lola/figures/ae_diagram.pdf}
+    \caption{Schematic representation of the autoencoder architecture. Downsampling (resp. upsampling) is performed with a space-to-depth (resp. depth-to-space) operation followed (resp. preceded) with a convolution initialized near identity.}
+    \label{fig:ae-diagram}
+\end{figure}
+
+\paragraph{Caching} The entire dataset is encoded with each trained autoencoder and the resulting latent trajectories are cached permanently on disk. The latter can then be used to train latent-space emulators, without needing to load and encode high-dimensional samples on the fly. Depending on hardware and data dimensionality, this approach can make a huge difference in I/O efficiency.
+
+\clearpage
+\paragraph{Emulators} The denoiser $d_\phi$ and neural solver $f_\phi$ are transformers with query-key normalization \cite{henry2020querykey}, rotary positional embedding (RoPE) \cite{su2024roformer, heo2025rotary}, and value residual learning \cite{zhou2024value}. The 16 blocks are modulated by the simulation parameters $\theta$ and the diffusion time $t$, as in diffusion transformers \cite{peebles2023scalable}. We train the emulator for $4096 \times 64$ steps of the Adam \cite{kingma2015adam} optimizer. Each latent-space emulator takes 2 (RB) or 5 (Euler, TGC) days to train on 8 H100 GPUs. Each pixel-space emulator takes 5 (RB) or 10 (Euler) days to train on 16 H100 GPUs. We do not train a pixel-space emulator for TGC. Other hyperparameters are provided in Table \ref{tab:emulator-details}
+
+During training we randomly sample the binary mask $b$. The number of context elements $c$ follows a Poisson distribution $\operatorname{Pois}(\lambda = 2)$ truncated between $1$ and $n$. Hence, the masks $b$ take the form
+\begin{equation}
+    b = (\underbrace{1, \dots, 1}_{c}, 0, \dots, 0)
+\end{equation}
+implicitly defining a distribution $p(b)$.
+
+\begin{table}[!h]
+    \centering
+    \caption{Hyperparameters for the emulators.}
+    \footnotesize
+    \begin{tabular}{lcc}
+        \toprule
+        & Latent-space & Pixel-space \\
+        \midrule
+        Architecture & Transformer & Transformer \\
+        Parameters & \num{2.2e8} & \num{8.6e8} \\
+        Input shape & $C_\text{latent} \times (n + 1) \times \frac{H}{32} \times \frac{W}{32}$ & $C_\text{pixel} \times (n + 1) \times H \times W$ \\
+        Patch size & $1 \times 1 \times 1$ & $1 \times 16 \times 16$ \\
+        Tokens & $(n + 1) \times \frac{H}{32} \times \frac{W}{32}$ & $(n + 1) \times \frac{H}{16} \times \frac{W}{16}$ \\[0.25em]
+        Embedding size & 1024 & 2048 \\
+        Blocks & 16 & 16 \\
+        Positional embedding & Absolute + RoPE & Absolute + RoPE \\
+        Activation & SiLU & SiLU \\
+        Normalization & LayerNorm & LayerNorm \\
+        Dropout & 0.05 & 0.05 \\
+        \midrule
+        Optimizer & Adam & Adam \\
+        Learning rate & \num{e-4} & \num{e-4} \\
+        Weight decay & 0.0 & 0.0 \\
+        Scheduler & cosine & cosine \\
+        Gradient norm clipping & 1.0 & 1.0 \\
+        Batch size & 256 & 256 \\
+        Steps per epoch & 64 & 64 \\
+        Epochs & 4096 & 4096 \\
+        GPUs & 8 & 16 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:emulator-details}
+\end{table}
+
+\paragraph{Evaluation} For each dataset, we randomly select 64 trajectories $x^{0:L}$ with various parameters $\theta$ in the test set. For each latent-space emulator, we encode the initial state $z^0 = E_\psi(x^0)$ and produce 16 distinct autoregressive rollouts $z^{1:L}$. For the diffusion models, sampling is performed with 16 steps of the 3rd order Adams-Bashforth multi-step integration method \cite{zhang2023fast}. The metrics (VRMSE, power spectrum RMSE, spread-skill ratio) are then measured between the predicted states $\hat{x}^i = D_\psi(z^i)$ and the ground-truth states $x^i$ or the autoencoded states $D_\psi(E_\psi(x^i))$.
+
+\clearpage
+\section{Additional emulation results} \label{app:emulation-results}
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=\textwidth]{./chapters/lola/figures/euler_mosaic_mean_absolute.pdf}
+    \includegraphics[width=\textwidth]{./chapters/lola/figures/rb_mosaic_mean_absolute.pdf}
+    \includegraphics[width=\textwidth]{./chapters/lola/figures/tgc_mosaic_mean_absolute.pdf}
+    \caption{Average evaluation metrics of latent-space emulation for the Euler (top), RB (center) and TGC (bottom) datasets. As expected from imperfect emulators, the emulation error grows with the lead time. However, increasing the compression rate does not degrade (Euler, TGC) and sometimes improves (RB) the accuracy of diffusion models. The spread-skill ratio \cite{fortin2014why, price2025probabilistic} drops slightly with the compression rate, which could be a sign of overfitting. Diffusion-based emulators are consistently more accurate than neural solvers.}
+    \label{fig:all-mosaic}
+\end{figure}
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=\textwidth]{./chapters/lola/figures/euler_mosaic_mean_relative.pdf}
+    \includegraphics[width=\textwidth]{./chapters/lola/figures/rb_mosaic_mean_relative.pdf}
+    \includegraphics[width=\textwidth]{./chapters/lola/figures/tgc_mosaic_mean_relative.pdf}
+    \caption{Average evaluation metrics of latent-space emulation relative to the autoencoded states $D_\psi(E_\psi(x^i))$ for the Euler (top), RB (center) and TGC (bottom) datasets. As expected from imperfect emulators, the emulation error grows with the lead time. However, increasing the compression rate does not degrade (Euler, TGC) and sometimes improves (RB) the accuracy of diffusion models. The spread-skill ratio \cite{fortin2014why, price2025probabilistic} drops slightly with the compression rate, which could be a sign of overfitting. Diffusion-based emulators are consistently more accurate than neural solvers.}
+    \label{fig:all-mosaic-relative}
+\end{figure}
+
+\begin{table}[!h]
+    \centering
+    \caption{Average VRMSE of autoencoder reconstruction and latent-space emulation at different compression rates ($\div$) and lead time horizons for the Euler, RB and TGC datasets. Increasing the compression rate has a clear impact on reconstruction quality, but does not degrade significantly (Euler, TGC) and sometimes improves (RB) the accuracy of diffusion models.}
+    \footnotesize
+    \begin{tabular}{lrccc}
+        \toprule
+        \multirow[c]{2}{*}{Method} & \multicolumn{4}{c}{Euler} \\
+        \cmidrule(lr){2-5}
+         & $\div$ & 1:20 & 21:60 & 61:100 \\
+        \midrule
+        \multirow[c]{3}{*}{autoencoder}
+        & 80 & 0.011 & 0.014 & 0.020 \\
+        & 320 & 0.023 & 0.041 & 0.061 \\
+        & 1280 & 0.060 & 0.107 & 0.144 \\
+        \midrule
+        \multirow[c]{3}{*}{diffusion}
+        & 80 & 0.075 & 0.199 & 0.395 \\
+        & 320 & 0.070 & 0.192 & 0.371 \\
+        & 1280 & 0.093 & 0.217 & 0.400 \\
+        \midrule
+        \multirow[c]{4}{*}{neural solver}
+        & 1 & 0.138 & 0.397 & 1.102 \\
+        & 80 & 0.077 & 0.232 & 0.500 \\
+        & 320 & 0.080 & 0.232 & 0.476 \\
+        & 1280 & 0.137 & 0.314 & 0.592 \\
+        \bottomrule
+    \end{tabular}
+    \hspace{1em}
+    \begin{tabular}{lrccc}
+        \toprule
+        \multirow[c]{2}{*}{Method} & \multicolumn{4}{c}{RB} \\
+        \cmidrule(lr){2-5}
+         & $\div$ & 1:20 & 21:60 & 61:180 \\
+        \midrule
+        \multirow[c]{3}{*}{autoencoder}
+        & 64   & 0.023 & 0.033 & 0.019 \\
+        & 256  & 0.039 & 0.064 & 0.042 \\
+        & 1024 & 0.070 & 0.124 & 0.092 \\
+        \midrule
+        \multirow[c]{3}{*}{diffusion}
+        & 64   & 0.171 & 0.582 & 0.704 \\
+        & 256  & 0.141 & 0.509 & 0.683 \\
+        & 1024 & 0.146 & 0.457 & 0.670 \\
+        \midrule
+        \multirow[c]{4}{*}{neural solver}
+        & 1    & 0.185 & 0.681 & 0.918 \\
+        & 64   & 0.244 & 0.761 & 0.968 \\
+        & 256  & 0.197 & 0.716 & 0.945 \\
+        & 1024 & 0.195 & 0.665 & 0.903 \\
+        \bottomrule
+    \end{tabular}
+
+    \vspace{1em}
+
+    \begin{tabular}{lrccc}
+        \toprule
+        \multirow[c]{2}{*}{Method} & \multicolumn{4}{c}{TGC} \\
+        \cmidrule(lr){2-5}
+         & $\div$ & 1:10 & 11:20 & 21:50 \\
+        \midrule
+        \multirow[c]{3}{*}{autoencoder}
+        & 48 & 0.151 & 0.116 & 0.129 \\
+        & 192 & 0.229 & 0.175 & 0.189 \\
+        & 768 & 0.338 & 0.272 & 0.276 \\
+        \midrule
+        \multirow[c]{3}{*}{diffusion}
+        & 48 & 0.296 & 0.522 & 0.673 \\
+        & 192 & 0.342 & 0.527 & 0.665 \\
+        & 768 & 0.425 & 0.575 & 0.694 \\
+        \midrule
+        \multirow[c]{4}{*}{neural solver}
+        & 48 & 0.302 & 0.599 & 0.826 \\
+        & 192 & 0.361 & 0.632 & 0.835 \\
+        & 768 & 0.462 & 0.710 & 0.920 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:vrmse-vs-compression}
+\end{table}
+
+\begin{table}[!h]
+    \centering
+    \caption{Average VRMSE of latent-space emulation at different context lengths ($c$) and lead time horizons for the Euler, RB and TGC datasets. We can test different context lengths without retraining as our models were trained for different conditioning tasks (see Section \ref{sec:lola-methodology}). Perhaps surprisingly, context lengths does not have a significant impact on emulation accuracy.}
+    \footnotesize
+    \begin{tabular}{lcccc}
+        \toprule
+        \multirow[c]{2}{*}{Method} & \multicolumn{4}{c}{Euler} \\
+        \cmidrule(lr){2-5}
+         & $c$ & 1:20 & 21:60 & 61:100 \\
+        \midrule
+        \multirow[c]{3}{*}{diffusion}
+        & 1 & 0.085 & 0.204 & 0.393 \\
+        & 2 & 0.074 & 0.200 & 0.383 \\
+        & 3 & 0.078 & 0.203 & 0.389 \\
+        \midrule
+        \multirow[c]{3}{*}{neural solver}
+        & 1 & 0.108 & 0.266 & 0.526 \\
+        & 2 & 0.092 & 0.253 & 0.513 \\
+        & 3 & 0.094 & 0.260 & 0.529 \\
+        \bottomrule
+    \end{tabular}
+    \hspace{1em}
+    \begin{tabular}{lcccc}
+        \toprule
+        \multirow[c]{2}{*}{Method} & \multicolumn{4}{c}{RB} \\
+        \cmidrule(lr){2-5}
+         & $c$ & 1:20 & 21:60 & 61:180 \\
+        \midrule
+        \multirow[c]{3}{*}{diffusion}
+        & 1 & 0.152 & 0.510 & 0.683 \\
+        & 2 & 0.150 & 0.511 & 0.685 \\
+        & 3 & 0.157 & 0.527 & 0.689 \\
+        \midrule
+        \multirow[c]{3}{*}{neural solver}
+        & 1 & 0.208 & 0.705 & 0.932 \\
+        & 2 & 0.209 & 0.708 & 0.943 \\
+        & 3 & 0.220 & 0.728 & 0.940 \\
+        \bottomrule
+    \end{tabular}
+
+    \vspace{1em}
+
+    \begin{tabular}{lcccc}
+        \toprule
+        \multirow[c]{2}{*}{Method} & \multicolumn{4}{c}{TGC} \\
+        \cmidrule(lr){2-5}
+         & $c$ & 1:10 & 11:20 & 21:50 \\
+        \midrule
+        \multirow[c]{3}{*}{diffusion}
+        & 1 & 0.362 & 0.550 & 0.681 \\
+        & 2 & 0.351 & 0.535 & 0.669 \\
+        & 3 & 0.350 & 0.539 & 0.683 \\
+        \midrule
+        \multirow[c]{3}{*}{neural solver}
+        & 1 & 0.376 & 0.632 & 0.837 \\
+        & 2 & 0.371 & 0.641 & 0.855 \\
+        & 3 & 0.378 & 0.669 & 0.888 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:vrmse-vs-context}
+\end{table}
+
+\begin{table}[h]
+    \centering
+    \caption{Average power spectrum RMSE of autoencoder reconstruction and latent-space emulation at different compression rates ($\div$) and lead time horizons for the Euler dataset. The high-frequency content of diffusion-based emulators is limited by the autoencoder's reconstruction capabilities.}
+    \footnotesize
+    \begin{tabular}{lrccccccccc}
+        \toprule
+        \multirow[c]{2}{*}{Method} & \multirow[c]{2}{*}{$\div$ \hspace{0.1em}} & \multicolumn{3}{c}{Low} & \multicolumn{3}{c}{Mid} & \multicolumn{3}{c}{High} \\
+        \cmidrule(lr){3-5} \cmidrule(lr){6-8} \cmidrule(lr){9-11}
+         & & 1:20 & 21:60 & 61:100 & 1:20 & 21:60 & 61:100 & 1:20 & 21:60 & 61:100 \\
+        \midrule
+        \multirow[c]{3}{*}{autoencoder}
+        & 80 & 0.001 & 0.001 & 0.001 & 0.006 & 0.008 & 0.014 & 0.072 & 0.069 & 0.096 \\
+        & 320 & 0.002 & 0.003 & 0.004 & 0.022 & 0.047 & 0.085 & 0.112 & 0.141 & 0.240 \\
+        & 1280 & 0.009 & 0.017 & 0.025 & 0.074 & 0.167 & 0.264 & 0.240 & 0.355 & 0.577 \\
+        \midrule
+        \multirow[c]{3}{*}{diffusion}
+        & 80 & 0.017 & 0.063 & 0.168 & 0.054 & 0.100 & 0.178 & 0.112 & 0.116 & 0.184 \\
+        & 320 & 0.014 & 0.058 & 0.157 & 0.052 & 0.102 & 0.171 & 0.128 & 0.155 & 0.275 \\
+        & 1280 & 0.019 & 0.065 & 0.163 & 0.096 & 0.187 & 0.300 & 0.246 & 0.349 & 0.569 \\
+        \midrule
+        \multirow[c]{4}{*}{neural solver}
+        & 1 & 0.046 & 0.128 & 0.339 & 0.227 & 0.297 & 0.754 & 0.821 & 0.984 & 2.666 \\
+        & 80 & 0.021 & 0.074 & 0.212 & 0.085 & 0.151 & 0.245 & 0.164 & 0.173 & 0.249 \\
+        & 320 & 0.020 & 0.075 & 0.204 & 0.074 & 0.144 & 0.234 & 0.151 & 0.169 & 0.271 \\
+        & 1280 & 0.045 & 0.116 & 0.274 & 0.131 & 0.227 & 0.349 & 0.283 & 0.345 & 0.545 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:euler-power-rmse}
+\end{table}
+
+\begin{table}[h]
+    \centering
+    \caption{Average power spectrum RMSE of autoencoder reconstruction and latent-space emulation at different compression rates ($\div$) and lead time horizons for the Rayleigh-Bénard dataset. The high-frequency content of diffusion-based emulators is limited by the autoencoder's reconstruction capabilities.}
+    \footnotesize
+    \begin{tabular}{lrccccccccc}
+        \toprule
+        \multirow[c]{2}{*}{Method} & \multirow[c]{2}{*}{$\div$ \hspace{0.1em}} & \multicolumn{3}{c}{Low} & \multicolumn{3}{c}{Mid} & \multicolumn{3}{c}{High} \\
+        \cmidrule(lr){3-5} \cmidrule(lr){6-8} \cmidrule(lr){9-11}
+         & & 1:20 & 21:60 & 61:180 & 1:20 & 21:60 & 61:180 & 1:20 & 21:60 & 61:180 \\
+        \midrule
+        \multirow[c]{3}{*}{autoencoder}
+        & 64   & 0.043 & 0.004 & 0.001 & 0.011 & 0.013 & 0.012 & 0.026 & 0.159 & 0.148 \\
+        & 256  & 0.061 & 0.011 & 0.004 & 0.028 & 0.080 & 0.075 & 0.050 & 0.220 & 0.212 \\
+        & 1024 & 0.121 & 0.033 & 0.018 & 0.063 & 0.186 & 0.197 & 0.076 & 0.294 & 0.294 \\
+        \midrule
+        \multirow[c]{3}{*}{diffusion}
+        & 64   & 1.751 & 0.850 & 0.386 & 0.197 & 0.266 & 0.159 & 0.054 & 0.220 & 0.199 \\
+        & 256  & 0.328 & 0.399 & 0.396 & 0.084 & 0.195 & 0.177 & 0.065 & 0.239 & 0.232 \\
+        & 1024 & 0.193 & 0.292 & 0.344 & 0.095 & 0.243 & 0.240 & 0.083 & 0.314 & 0.297 \\
+        \midrule
+        \multirow[c]{4}{*}{neural solver}
+        & 1    & 0.467 & 0.520 & 0.650 & 0.151 & 0.255 & 0.264 & 0.076 & 0.232 & 0.242 \\
+        & 64   & 3.625 & 0.915 & 0.566 & 0.268 & 0.351 & 0.275 & 0.099 & 0.279 & 0.257 \\
+        & 256  & 0.575 & 0.675 & 0.526 & 0.165 & 0.317 & 0.264 & 0.091 & 0.275 & 0.257 \\
+        & 1024 & 0.285 & 0.496 & 0.560 & 0.152 & 0.338 & 0.321 & 0.090 & 0.320 & 0.326 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:rb-power-rmse}
+\end{table}
+
+\begin{table}[h]
+    \centering
+    \caption{Average power spectrum RMSE of autoencoder reconstruction and latent-space emulation at different compression rates ($\div$) and lead time horizons for the TGC dataset. The high-frequency content of diffusion-based emulators is limited by the autoencoder's reconstruction capabilities.}
+    \footnotesize
+    \begin{tabular}{lrccccccccc}
+        \toprule
+        \multirow[c]{2}{*}{Method} & \multirow[c]{2}{*}{$\div$ \hspace{0.1em}} & \multicolumn{3}{c}{Low} & \multicolumn{3}{c}{Mid} & \multicolumn{3}{c}{High} \\
+        \cmidrule(lr){3-5} \cmidrule(lr){6-8} \cmidrule(lr){9-11}
+        & & 1:10 & 11:30 & 31:50 & 1:10 & 11:30 & 31:50 & 1:10 & 11:30 & 31:50 \\
+        \midrule
+        \multirow[c]{3}{*}{autoencoder}
+        & 48 & 0.011 & 0.016 & 0.025 & 0.023 & 0.026 & 0.044 & 0.275 & 0.188 & 0.195 \\
+        & 192 & 0.028 & 0.033 & 0.045 & 0.108 & 0.091 & 0.114 & 0.359 & 0.273 & 0.282 \\
+        & 768 & 0.072 & 0.068 & 0.080 & 0.285 & 0.235 & 0.254 & 0.454 & 0.476 & 0.367 \\
+        \midrule
+        \multirow[c]{3}{*}{diffusion}
+        & 48 & 0.064 & 0.185 & 0.319 & 0.058 & 0.128 & 0.220 & 0.296 & 0.247 & 0.331 \\
+        & 192 & 0.069 & 0.191 & 0.311 & 0.128 & 0.164 & 0.252 & 0.369 & 0.316 & 0.384 \\
+        & 768 & 0.107 & 0.294 & 0.425 & 0.289 & 0.305 & 0.360 & 0.456 & 0.419 & 0.444 \\
+        \midrule
+        \multirow[c]{3}{*}{neural solver}
+        & 48 & 0.070 & 0.221 & 0.424 & 0.110 & 0.197 & 0.324 & 0.357 & 0.320 & 0.427 \\
+        & 192 & 0.086 & 0.228 & 0.402 & 0.172 & 0.201 & 0.295 & 0.391 & 0.317 & 0.395 \\
+        & 768 & 0.138 & 0.277 & 0.465 & 0.322 & 0.305 & 0.407 & 0.471 & 0.418 & 0.493 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:tgc-power-rmse}
+\end{table}
+
+\begin{table}[h]
+    \centering
+    \caption{Average sliced earth mover's distance (SEMD) \cite{bonneel2015sliced, kolouri2019generalized} of the density field of autoencoder reconstruction and latent-space emulation at different compression rates ($\div$) and lead time horizons for the Euler dataset. The SEMD is small and is not significantly impacted by the compression rate, especially for diffusion models. For reference, the density fields of two consecutive states $x^i$ and $x^{i+1}$ have a typical SEMD of $0.0025$. \emph{Why this metric?} The Euler equations are sometimes used in aerodynamics to model flow around objects and one is typically interested in the global fluid displacement. The rationale for using this metric is that a small drift in the density field would not significantly affect the (S)EMD, while it could affect point-wise metrics heavily.}
+    \footnotesize
+    \begin{tabular}{lrccc}
+        \toprule
+        \multirow[c]{2}{*}{Method} & \multicolumn{4}{c}{EMD (density field)} \\
+        \cmidrule(lr){2-5}
+        & $\div$ & 1:20 & 21:60 & 61:100 \\
+        \midrule
+        \multirow[c]{3}{*}{autoencoder}
+        & 80 & 0.0000 & 0.0000 & 0.0000 \\
+        & 320 & 0.0001 & 0.0001 & 0.0001 \\
+        & 1280 & 0.0002 & 0.0003 & 0.0005 \\
+        \midrule
+        \multirow[c]{3}{*}{diffusion}
+        & 80 & 0.0004 & 0.0010 & 0.0023 \\
+        & 320 & 0.0003 & 0.0009 & 0.0022 \\
+        & 1280 & 0.0004 & 0.0010 & 0.0023 \\
+        \midrule
+        \multirow[c]{4}{*}{neural solver}
+        & 1 & 0.0011 & 0.0031 & 0.0066 \\
+        & 80 & 0.0005 & 0.0012 & 0.0028 \\
+        & 320 & 0.0004 & 0.0012 & 0.0027 \\
+        & 1280 & 0.0008 & 0.0020 & 0.0041 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:emd-euler-vs-compression}
+\end{table}
+
+\begin{table}[h]
+    \centering
+    \caption{Average Wasserstein distance of the distribution of vertical velocity values of autoencoder reconstruction and latent-space emulation at different compression rates ($\div$) and lead time horizons for the RB dataset. The Wasserstein distance is smaller for diffusion models and decreases with the compression rate. For reference, the distributions of vertical velocity values of two consecutive states $x^i$ and $x^{i+1}$ have a typical Wasserstein distance of $0.004$. \emph{Why this metric?} One interesting quantity in buoyancy-driven convection is the growth speed of plumes in the fluid. The distribution of the (vertical) velocity values is a good summary statistic for tracking the growth of plumes.}
+    \footnotesize
+    \begin{tabular}{lrccc}
+        \toprule
+        \multirow[c]{2}{*}{Method} & \multicolumn{4}{c}{Wasserstein (vertical velocity field)} \\
+        \cmidrule(lr){2-5}
+         & $\div$ & 1:20 & 21:60 & 61:180 \\
+        \midrule
+        \multirow[c]{3}{*}{autoencoder}
+        & 64   & 0.0000 & 0.0002 & 0.0002 \\
+        & 256  & 0.0001 & 0.0007 & 0.0005 \\
+        & 1024 & 0.0002 & 0.0020 & 0.0018 \\
+        \midrule
+        \multirow[c]{3}{*}{diffusion}
+        & 64   & 0.0003 & 0.0104 & 0.0141 \\
+        & 256  & 0.0003 & 0.0092 & 0.0141 \\
+        & 1024 & 0.0004 & 0.0063 & 0.0139 \\
+        \midrule
+        \multirow[c]{4}{*}{neural solver}
+        & 1    & 0.0003 & 0.0153 & 0.0247 \\
+        & 64   & 0.0009 & 0.0272 & 0.0223 \\
+        & 256  & 0.0007 & 0.0197 & 0.0187 \\
+        & 1024 & 0.0007 & 0.0157 & 0.0206 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:wasserstein-rb-vs-compression}
+\end{table}
+
+\begin{table}[h]
+    \centering
+    \caption{Average Wasserstein distance of the distribution of density values of autoencoder reconstruction and latent-space emulation at different compression rates ($\div$) and lead time horizons for the TGC dataset. The Wasserstein distance is smaller for diffusion models, but grows significantly with the lead time, even for the autoencoder reconstruction. For reference, the distributions of density values of two consecutive states $x^i$ and $x^{i+1}$ have a typical Wasserstein distance of $0.01$. \emph{Why this metric?} In the interstellar medium, gravity forms clusters of matter that eventually lead to the birth of stars. The kind of clusters (compact, diffuse, or anything in between) and their proportions is of interest for domain-scientists. The distribution of the density values is a good summary statistic for clustering dynamics.}
+    \footnotesize
+    \begin{tabular}{lrccc}
+        \toprule
+        \multirow[c]{2}{*}{Method} & \multicolumn{4}{c}{Wasserstein (density field)} \\
+        \cmidrule(lr){2-5}
+         & $\div$ & 1:10 & 11:30 & 31:50 \\
+        \midrule
+        \multirow[c]{3}{*}{autoencoder}
+        & 48  & 0.0034 & 0.0048 & 0.0089 \\
+        & 192 & 0.0082 & 0.0110 & 0.0183 \\
+        & 768 & 0.0181 & 0.0236 & 0.0338 \\
+        \midrule
+        \multirow[c]{3}{*}{diffusion}
+        & 48  & 0.0044 & 0.0138 & 0.0266 \\
+        & 192 & 0.0089 & 0.0172 & 0.0310 \\
+        & 768 & 0.0186 & 0.0274 & 0.0425 \\
+        \midrule
+        \multirow[c]{3}{*}{neural solver}
+        & 48  & 0.0074 & 0.0253 & 0.0524 \\
+        & 192 & 0.0091 & 0.0171 & 0.0329 \\
+        & 768 & 0.0220 & 0.0296 & 0.0492 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:wasserstein-tgc-vs-compression}
+\end{table}
+
+\begin{table}[h]
+    \centering
+    \caption{Average VRMSE results from various studies using TheWell \cite{ohana2024well} datasets. Even though our latent neural solvers (LNSs) and latent diffusion models (LDMs) outperform most published baselines, we emphasize that we do not position our models as state-of-the-art, due to the discrepancies in parameter count, training and evaluation. Notably, the U-Net and FNO baselines trained by \textcite{ohana2024well} are much smaller than other models, and their hyper-parameters were not tuned.}
+    \footnotesize
+    \begin{tabular}{lccccc}
+        \toprule
+        Source & Method & Dataset & Parameters & Lead time & VRMSE \\
+        \midrule
+        \textcite{ohana2024well} & FNO & Euler & \num{2e7} & 6:12 & 1.13 \\
+        \textcite{ohana2024well} & U-Net & Euler & \num{2e7} & 6:12 & 1.02 \\
+        Ours & ViT & Euler & \num{8.6e8} & 1:20 & 0.138 \\
+        Ours & LNS $\div_{80}$ & Euler & \num{3.1e8} + \num{2.2e8} & 1:20 & 0.077 \\
+        Ours & LDM $\div_{80}$ & Euler & \num{3.1e8} + \num{2.2e8} & 1:20 & 0.075 \\
+        \midrule
+        \textcite{ohana2024well} & FNO & RB & \num{2e7} & 6:12 & 10+ \\
+        \textcite{ohana2024well} & U-Net & RB & \num{2e7} & 6:12 & 10+ \\
+        \textcite{nguyen2025physix} & PhysiX & RB & \num{4.5e9} & 2:8 & 1.067 \\
+        \textcite{wu2025tante} & TANTE & RB & \num{e8} & 1:16 & 0.609 \\
+        \textcite{mukhopadhyay2025controllable} & ViT + CSM & RB & \num{e8} & 10 & 0.140 \\
+        Ours & ViT & RB & \num{8.6e8} & 1:20 & 0.185 \\
+        Ours & LNS $\div_{256}$ & RB & \num{3.1e8} + \num{2.2e8} & 1:20 & 0.197 \\
+        Ours & LDM $\div_{256}$ & RB & \num{3.1e8} + \num{2.2e8} & 1:20 & 0.141 \\
+        \midrule
+        \textcite{ohana2024well} & FNO & TGC & \num{2e7} & 6:12 & 3.55 \\
+        \textcite{ohana2024well} & U-Net & TGC & \num{2e7} & 6:12 & 7.14 \\
+        \textcite{mukhopadhyay2025controllable} & ViT + CKM & TGC & \num{e8} & 10 & 0.527 \\
+        Ours & LNS $\div_{48}$ & TGC & \num{7.2e8} + \num{2.2e8} & 1:10 & 0.302 \\
+        Ours & LDM $\div_{48}$ & TGC & \num{7.2e8} + \num{2.2e8} & 1:10 & 0.296 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:vrmse-baselines}
+\end{table}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_3.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_4.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_5.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_6.pdf}
+    \caption{Examples of emulation at different compression rates ($\div$) for the Euler dataset. In this simulation, the system has open boundary conditions.}
+    \label{fig:viz-euler-1}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_7.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_8.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_9.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_10.pdf}
+    \caption{Examples of emulation at different compression rates ($\div$) for the Euler dataset. In this simulation, the system has periodic boundary conditions.}
+    \label{fig:viz-euler-2}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_11.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_12.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_13.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_14.pdf}
+    \caption{Examples of emulation at different compression rates ($\div$) for the Euler dataset. In this simulation, the system has periodic boundary conditions.}
+    \label{fig:viz-euler-3}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_15.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_16.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_17.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_18.pdf}
+    \caption{Examples of emulation at different compression rates ($\div$) for the Euler dataset. In this simulation, the system has periodic boundary conditions.}
+    \label{fig:viz-euler-4}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_19.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_20.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_21.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_22.pdf}
+    \caption{Examples of emulation at different compression rates ($\div$) for the Rayleigh-Bénard dataset. In this simulation, the fluid is in a low-turbulence regime ($\mathrm{Ra} = \num{e6}$).}
+    \label{fig:viz-rb-1}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_23.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_24.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_25.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_26.pdf}
+    \caption{Examples of emulation at different compression rates ($\div$) for the Rayleigh-Bénard dataset. In this simulation, the fluid is in a high-turbulence regime ($\mathrm{Ra} = \num{e8}$).}
+    \label{fig:viz-rb-2}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_27.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_28.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_29.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_30.pdf}
+    \caption{Examples of emulation at different compression rates ($\div$) for the Rayleigh-Bénard dataset. In this simulation, the fluid is in a low-turbulence regime ($\mathrm{Ra} = \num{e6}$).}
+    \label{fig:viz-rb-3}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_31.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_32.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_33.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_34.pdf}
+    \caption{Examples of emulation at different compression rates ($\div$) for the Rayleigh-Bénard dataset. In this simulation, the fluid is in a high-turbulence regime ($\mathrm{Ra} = \num{e8}$).}
+    \label{fig:viz-rb-4}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \hspace{0.49\textwidth}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_36.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_37.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_38.pdf}
+    \caption{Examples of emulation at different compression rates ($\div$) for the TGC dataset. In this simulation, the initial density is low and the initial temperature is low ($\rho_0 = 0.445$, $T_0 = 10.0$).}
+    \label{fig:viz-tgc-1}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \hspace{0.49\textwidth}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_40.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_41.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_42.pdf}
+    \caption{Examples of emulation at different compression rates ($\div$) for the TGC dataset. In this simulation, the initial density is medium and the initial temperature is high ($\rho_0 = 4.45$, $T_0 = 1000.0$).}
+    \label{fig:viz-tgc-2}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \hspace{0.49\textwidth}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_44.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_45.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_46.pdf}
+    \caption{Examples of emulation at different compression rates ($\div$) for the TGC dataset. In this simulation, the initial density is high and the initial temperature is low ($\rho_0 = 44.5$, $T_0 = 10.0$).}
+    \label{fig:viz-tgc-3}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \hspace{0.49\textwidth}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_48.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_49.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/compressed/examples/example_50.pdf}
+    \caption{Examples of emulation at different compression rates ($\div$) for the TGC dataset. In this simulation, the initial density is high and the initial temperature is medium ($\rho_0 = 44.5$, $T_0 = 100.0$).}
+    \label{fig:viz-tgc-4}
+\end{figure}
+
+\clearpage
+\section{Latent space analysis} \label{app:latent-analysis}
+
+In this section, we conduct a short analysis of the learned latent representations. We are notably interested in the separability of the latent representation with respect to different parameteres $\theta$.
+
+For our first experiment, we select a random initial state $x^1$ from the test split of the Euler dataset. We compute the initial state $z^1 = E_\psi(x^1)$ for the $\div_{80}$ autoencoder. For each heat capacity $\gamma \in \{1.2, 1.3, 1.4, 1.5, 1.6\}$, we generate one latent trajectory $z^{1:L}$ with the diffusion-based emulator. Afterwards we compute the Euclidean distance $|| z^i_a - z^i_b ||_2$ for each pair $(\gamma_a, \gamma_b)$ of heat capacities. We report the results in Table \ref{tab:euler-theta-distance} and represent the trajectories in Figure \ref{fig:euler-theta-viz}. As expected, trajectories with similar heat capacity $\gamma$ are close to each others.
+
+For our second experiment, we compute the latent representations $z^i = E_\psi(x^i) \in \mathbb{R}^{16 \times 4 \times 64}$ of the $\div_{64}$ autoencoder for randomly selected states $x^i$ of the Rayleigh-Bénard dataset. We then train a small multi-layer perceptron (MLP) to predict the simulation parameters $\theta$ (Rayleigh and Prandtl numbers) from the latent state's central token $z^i[8, 2] \in \mathbb{R}^{64}$. We extract the activations of the MLP's last layer and visualize them with t-SNE \cite{maaten2008visualizing} in Figure \ref{fig:rb-theta-tsne}. We observe that t-SNE \cite{maaten2008visualizing} continuously separates latent states with respect to their parameters $\theta$, indicating that our autoencoders learn to distinguish between different physics. We further validate this result by computing the pairwise Bures-Wasserstein distances \cite{peyre2019computational} between the distributions of central tokens $z^i[8, 2]$ for different Rayleigh and Prandtl numbers. The distances, reported in Tables \ref{tab:rb-rayleigh-bw} and \ref{tab:rb-prandtl-bw}, are anti-correlated with the similarity of simulation parameters $\theta$.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.625\textwidth]{./chapters/lola/compressed/examples/example_51.pdf}
+    \caption{Example of emulated trajectories with different heat capacities $\gamma \in \{1.2, 1.3, 1.4, 1.5, 1.6\}$ but starting at the same initial state $x^1$ for the Euler dataset. The energy field is visualized instead of the density field to emphasize the differences.}
+    \label{fig:euler-theta-viz}
+\end{figure}
+
+\begin{table}[h]
+    \centering
+    \caption{Euclidean distance matrix between emulated trajectories with different heat capacities $\gamma \in \{1.2, 1.3, 1.4, 1.5, 1.6\}$ but starting at the same initial state $x^1$ for the Euler dataset.}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{c|ccccc}
+    \toprule
+    $\tau = 1$ & 1.2 & 1.3 & 1.4 & 1.5 & 1.6 \\
+    \midrule
+    1.2 & 0.00 & 26.61 & 32.45 & 38.46 & 46.28 \\
+    1.3 & 26.61 & 0.00 & 14.72 & 22.09 & 32.33 \\
+    1.4 & 32.45 & 14.72 & 0.00 & 15.26 & 25.62 \\
+    1.5 & 38.46 & 22.09 & 15.26 & 0.00 & 18.52 \\
+    1.6 & 46.28 & 32.33 & 25.62 & 18.52 & 0.00 \\
+    \midrule
+    $\tau = 60$ & 1.2 & 1.3 & 1.4 & 1.5 & 1.6 \\
+    \midrule
+    1.2 & 0.00 & 74.68 & 84.37 & 90.41 & 96.04 \\
+    1.3 & 74.68 & 0.00 & 67.06 & 75.22 & 82.20 \\
+    1.4 & 84.37 & 67.06 & 0.00 & 67.42 & 76.49 \\
+    1.5 & 90.41 & 75.22 & 67.42 & 0.00 & 71.58 \\
+    1.6 & 96.04 & 82.20 & 76.49 & 71.58 & 0.00 \\
+    \bottomrule
+    \end{tabular}
+    \begin{tabular}{c|ccccc}
+    \toprule
+    $\tau = 20$ & 1.2 & 1.3 & 1.4 & 1.5 & 1.6 \\
+    \midrule
+    1.2 & 0.00 & 55.95 & 64.92 & 71.06 & 78.85 \\
+    1.3 & 55.95 & 0.00 & 38.93 & 55.03 & 66.19 \\
+    1.4 & 64.92 & 38.93 & 0.00 & 44.00 & 59.93 \\
+    1.5 & 71.06 & 55.03 & 44.00 & 0.00 & 52.14 \\
+    1.6 & 78.85 & 66.19 & 59.93 & 52.14 & 0.00 \\
+    \midrule
+    $\tau = 100$ & 1.2 & 1.3 & 1.4 & 1.5 & 1.6 \\
+    \midrule
+    1.2 & 0.00 & 74.71 & 82.09 & 90.16 & 94.79 \\
+    1.3 & 74.71 & 0.00 & 66.72 & 74.16 & 81.68 \\
+    1.4 & 82.09 & 66.72 & 0.00 & 67.51 & 74.72 \\
+    1.5 & 90.16 & 74.16 & 67.51 & 0.00 & 69.75 \\
+    1.6 & 94.79 & 81.68 & 74.72 & 69.75 & 0.00 \\
+    \bottomrule
+    \end{tabular}}
+    \label{tab:euler-theta-distance}
+\end{table}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/figures/rb_tsne_rayleigh.pdf}
+    \includegraphics[width=0.49\textwidth]{./chapters/lola/figures/rb_tsne_prandtl.pdf}
+    \caption{t-SNE \cite{maaten2008visualizing} visualization of the latent states $z^i = E_\psi(x^i)$. The projections are colored with respect to their Rayleigh (left) and Prandtl (right) numbers.}
+    \label{fig:rb-theta-tsne}
+\end{figure}
+
+\begin{table}[h]
+    \centering
+    \caption{Bures-Wasserstein distance matrix between the distributions of latent states $z^i = E_\psi(x^i)$ with different Rayleigh numbers.}
+    \footnotesize
+    \begin{tabular}{l|ccccc}
+    \toprule
+    & \num{e6} & \num{e7} & \num{e8} & \num{e9} & \num{e10} \\
+    \midrule
+    \num{e6} & 0.000 & 1.045 & 1.708 & 2.279 & 2.489 \\
+    \num{e7} & 1.045 & 0.000 & 0.965 & 1.537 & 1.794 \\
+    \num{e8} & 1.708 & 0.965 & 0.000 & 0.915 & 1.180 \\
+    \num{e9} & 2.279 & 1.537 & 0.915 & 0.000 & 0.714 \\
+    \num{e10} & 2.489 & 1.794 & 1.180 & 0.714 & 0.000 \\
+    \bottomrule
+    \end{tabular}
+    \label{tab:rb-rayleigh-bw}
+\end{table}
+
+\begin{table}[h]
+    \centering
+    \caption{Bures-Wasserstein distance matrix between the distributions of latent states $z^i = E_\psi(x^i)$ with different Prandtl numbers.}
+    \footnotesize
+    \begin{tabular}{l|ccccccc}
+    \toprule
+    & 0.1 & 0.2 & 0.5 & 1.0 & 2.0 & 5.0 & 10.0 \\
+    \midrule
+    0.1  & 0.000 & 1.367 & 2.042 & 2.631 & 3.244 & 3.884 & 4.210 \\
+    0.2  & 1.367 & 0.000 & 1.269 & 1.839 & 2.381 & 3.007 & 3.331 \\
+    0.5  & 2.042 & 1.269 & 0.000 & 0.986 & 1.479 & 2.093 & 2.398 \\
+    1.0  & 2.631 & 1.839 & 0.986 & 0.000 & 0.930 & 1.472 & 1.766 \\
+    2.0  & 3.244 & 2.381 & 1.479 & 0.930 & 0.000 & 0.988 & 1.251 \\
+    5.0  & 3.884 & 3.007 & 2.093 & 1.472 & 0.988 & 0.000 & 0.711 \\
+    10.0 & 4.210 & 3.331 & 2.398 & 1.766 & 1.251 & 0.711 & 0.000 \\
+    \bottomrule
+    \end{tabular}
+    \label{tab:rb-prandtl-bw}
+\end{table}
+
+\end{subappendices}

@@ -1,0 +1,21 @@
+\documentclass[margin=0cm]{standalone}
+
+\PassOptionsToPackage{dvipsnames}{xcolor}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta}
+\usetikzlibrary{calc}
+\tikzset{
+    every node/.style={align=center},
+}
+
+\begin{document}
+\begin{tikzpicture}
+    \node[inner sep=0, anchor=north west] at (0, 0) {\includegraphics[width=15cm]{fastmri_crop.png}};
+    \node[inner sep=1, rotate=90] at (-0.25, -1.5) {Ground-truth};
+    \node[inner sep=1, rotate=90] at (-0.25, -4.5) {Observation};
+    \node[inner sep=1, rotate=90] at (-0.25, -7.5) {Sample 1};
+    \node[inner sep=1, rotate=90] at (-0.25, -10.5) {Sample 2};
+\end{tikzpicture}
+\end{document}
